@@ -63,6 +63,40 @@ Warehouse Server có cùng bộ API (xem `server/README.md`): `GET/POST
 /api/pick-tasks/:id/confirm`, `GET /api/shipments`, `POST
 /api/shipments/:id/returns`, `POST /api/returns/:id/qc|putaway`.
 
+## GĐ3 — Vận hành kho (Kiểm kê quay vòng → Đóng băng → Chuyển kho → Gợi ý đặt hàng → Cảnh báo)
+
+Mục *Kiểm đếm → Vận hành kho* (chỉ áp cho hàng theo lô của sổ cái; phiếu kiểm
+mù cũ cho hàng nạp file ở mục Kiểm kho không đổi):
+
+1. **Kiểm kê quay vòng** (số CC-xxxx): tạo phiên theo **vị trí / khu / SKU** —
+   hệ thống chụp snapshot tồn sổ sách (chỉ đếm xô tồn vật lý; phần đang đóng
+   băng / chờ QC ghi riêng để đối chiếu). Có **chế độ mù** (ẩn số sổ sách khi
+   đếm). Đếm xong, người có quyền duyệt mới **áp chênh lệch** vào tồn bằng
+   movement điều chỉnh kèm lý do *Chênh lệch kiểm kê*; đúng số thì không sinh
+   biến động. Phiên có thể bị từ chối để đếm lại.
+2. **Đóng băng (Freeze/Hold)**: khóa tồn theo lô + vị trí kèm lý do bắt buộc
+   (chờ kiểm tra chất lượng, nghi hỏng…). Hàng đang băng **không được phân bổ**
+   cho đơn xuất; mở băng từng phần khi xử lý xong.
+3. **Chuyển kho**: chuyển vị trí nhanh trong kho (movement MOVE) và **phiếu
+   chuyển kho** (số CK-xxxx) 2 bước có chứng từ: xuất ở kho nguồn (hàng sang
+   trạng thái đang chuyển) → nhận ở kho đích.
+4. **Gợi ý đặt hàng**: đặt min/max (và điểm đặt lại) cho từng SKU; khi khả
+   dụng chạm ngưỡng, hệ thống gợi ý số cần đặt = max − khả dụng − đang đặt,
+   **gom theo nhà cung cấp mặc định của SKU** và tạo **PO nháp** một chạm
+   (giá lấy theo giá nhập gần nhất). SKU chưa gán NCC mặc định được tách nhóm
+   cảnh báo riêng, không tạo PO.
+5. **Cảnh báo**: bấm *Quét cảnh báo* để quét từ dữ liệu lô/tồn thật — sắp hết
+   hạn (30/15/7 ngày, đã hết hạn), tồn thấp / hết hàng theo min, hàng chờ QC,
+   hàng đang đóng băng. Cảnh báo tự đóng khi hết điều kiện; người dùng xác
+   nhận "Đã biết" cho cảnh báo đang theo dõi.
+
+Warehouse Server có cùng bộ API (xem `server/README.md`): `GET/POST
+/api/cycle-counts` + `count|approve|reject`, `POST /api/inventory/freeze|
+unfreeze|move`, `GET /api/inventory/frozen`, `GET/POST /api/transfer-orders`
++ `ship|receive|cancel`, `GET/PUT /api/stock-policies`, `GET
+/api/replenishment/suggestions`, `POST /api/replenishment/create-pos`,
+`POST /api/alerts/scan`, `GET /api/alerts`, `POST /api/alerts/:id/ack`.
+
 ## Triển khai lên GitHub Pages
 
 Địa chỉ app: `https://quocdung2107.github.io/wms/`

@@ -42,6 +42,16 @@ export function rebuildBalances(movements: readonly StockMovement[]): Map<string
       put(applyBucketDelta(dst, { on_hand: m.qty }, 'MOVE (cộng đích)'))
       continue
     }
+    if (m.type === 'TRANSFER_IN' && m.from_location_id != null) {
+      // GĐ3: nhận chuyển kho hai phía — nguồn (kho/vị trí nguồn): in_transit-;
+      // đích (warehouse_id/location_id của movement): on_hand+. Khớp recordMovement.
+      const srcM: StockMovement = { ...m, warehouse_id: m.from_warehouse_id ?? m.warehouse_id }
+      const src = get(srcM, m.from_location_id)
+      put(applyBucketDelta(src, { in_transit: -m.qty }, 'TRANSFER_IN (trừ nguồn)'))
+      const dst = get(m, m.location_id)
+      put(applyBucketDelta(dst, { on_hand: m.qty }, 'TRANSFER_IN (cộng đích)'))
+      continue
+    }
     if (m.type === 'PUTAWAY' && m.from_location_id != null && m.from_location_id !== m.location_id) {
       // GĐ1: putaway khác vị trí — nguồn (khu nhận): on_hand- và inspect-;
       // đích: on_hand+ (hàng thành khả dụng tại vị trí đích). Khớp recordMovement.

@@ -135,6 +135,38 @@ lưu tham chiếu (`external_ref`, tên xe dạng text) — không sửa luồng
 | `POST /api/returns/:id/putaway` | inventory_putaway | Cất hàng trả đã QC đạt (`{return_line_id, qty, to_location_id}`) |
 | `GET /api/returns` | inventory_view | Phiếu trả + dòng |
 
+## API vận hành kho GĐ3 (Kiểm kê quay vòng → Đóng băng → Chuyển kho → Gợi ý đặt hàng → Cảnh báo)
+
+Chỉ áp cho hàng theo lô của sổ cái. Mọi thay đổi tồn đều qua movement kèm
+lý do khi thuộc nhóm bắt buộc.
+
+| Endpoint | Quyền | Việc |
+|---|---|---|
+| `GET /api/cycle-counts` / `GET /api/cycle-counts/:id` | inventory_view | Phiên kiểm kê (+ dòng kiểm) |
+| `POST /api/cycle-counts` | inventory_count | Tạo phiên theo phạm vi (`{scope_type: LOCATION\|ZONE\|SKU, location_id?/zone_id?/sku?, blind?}`) — snapshot từ balances |
+| `POST /api/cycle-counts/:id/count` | inventory_count | Nhập số đếm (`{entries: [{task_id, counted_qty}]}`) — đủ mọi dòng → COUNTED |
+| `POST /api/cycle-counts/:id/approve` | inventory_adjust | Duyệt + áp chênh lệch (ADJUST_IN/OUT, lý do COUNT_VARIANCE) → APPLIED |
+| `POST /api/cycle-counts/:id/reject` | inventory_adjust | Từ chối phiên (đếm lại) |
+| `POST /api/inventory/freeze` | inventory_adjust | Đóng băng (`{sku, lot_id, location_id, warehouse_id?, qty, reason_code}` — lý do bắt buộc thuộc danh mục) |
+| `POST /api/inventory/unfreeze` | inventory_adjust | Mở băng (`{sku, lot_id, location_id, warehouse_id?, qty}`) |
+| `GET /api/inventory/frozen` | inventory_view | Danh sách đang đóng băng kèm lý do/người băng gần nhất |
+| `POST /api/inventory/move` | inventory_transfer | Chuyển vị trí trong kho (`{sku, lot_id, warehouse_id?, from_location_id, to_location_id, qty}`) — chỉ chuyển phần khả dụng |
+| `GET /api/transfer-orders` / `GET /api/transfer-orders/:id` | inventory_view | Phiếu chuyển kho (+ dòng) |
+| `POST /api/transfer-orders` | inventory_transfer | Tạo phiếu (`{from_warehouse_id, to_warehouse_id, lines: [{sku, lot_id, from_location_id, to_location_id, qty}]}`) — số CK-xxxx |
+| `POST /api/transfer-orders/:id/ship` | inventory_transfer | Xuất kho nguồn (TRANSFER_OUT → đang chuyển) |
+| `POST /api/transfer-orders/:id/receive` | inventory_transfer | Nhận kho đích (TRANSFER_IN hai phía) → DONE |
+| `POST /api/transfer-orders/:id/cancel` | inventory_transfer | Huỷ phiếu nháp |
+| `GET /api/stock-policies` | inventory_view | Chính sách tồn min/max |
+| `PUT /api/stock-policies` | inventory_view | Đặt/sửa chính sách (`{sku, warehouse_id?, min_qty, max_qty, reorder_point, reorder_qty}`) |
+| `GET /api/replenishment/suggestions` | inventory_view | Gợi ý đặt hàng đã gom theo NCC mặc định |
+| `POST /api/replenishment/create-pos` | purchase_create | Tạo PO nháp DRAFT từ gợi ý (nhóm chưa rõ NCC bị bỏ qua) |
+| `PUT /api/products/default-supplier` | purchase_create | Gán NCC mặc định cho SKU (`{sku, supplier_id}`) |
+| `GET /api/suppliers` / `POST /api/suppliers` | inventory_view / purchase_create | Danh sách / tạo nhà cung cấp |
+| `POST /api/warehouses` / `POST /api/locations` | inventory_transfer | Tạo kho / vị trí (hỗ trợ dựng kho đích chuyển kho) |
+| `POST /api/alerts/scan` | inventory_view | Quét cảnh báo từ lô/tồn hiện tại (upsert theo khoá, hết điều kiện tự RESOLVED) |
+| `GET /api/alerts` (`?status=`) | inventory_view | Danh sách cảnh báo |
+| `POST /api/alerts/:id/ack` | inventory_adjust | Xác nhận đã biết |
+
 ## Kiểm thử server (cho người kỹ thuật)
 
 ```
@@ -144,7 +176,10 @@ node server/test-smoke.mjs
 Script tự mở server ở cổng test với DB tạm, chạy hết luồng
 đăng nhập → duyệt thiết bị → biến động tồn → liên kho → GĐ1 (PO → nhận →
 QC → cất hàng → kiểm balances) → GĐ2 (đơn xuất → phân bổ → wave → lấy →
-đóng gói → giao → trả hàng về lô gốc → QC → cất lại) → sao lưu,
+đóng gói → giao → trả hàng về lô gốc → QC → cất lại) → GĐ3 (đóng băng →
+phân bổ bị chặn một phần → chuyển vị trí → kiểm kê quay vòng đếm thiếu →
+duyệt áp chênh lệch → chuyển kho 2 bước → gợi ý đặt hàng → PO nháp →
+cảnh báo hết hạn/tồn thấp) → sao lưu,
 xong tự dọn. Không nằm trong `npm test` chính vì cần mở cổng mạng.
 
 ## Các biến môi trường

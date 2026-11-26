@@ -69,7 +69,7 @@ function balanceStatement(row: LedgerRow | null, b: StockBalance, at: string): L
   }
 }
 
-const MOVEMENT_COLS = `movement_no, type, warehouse_id, location_id, from_location_id, lot_id, sku, qty,
+const MOVEMENT_COLS = `movement_no, type, warehouse_id, location_id, from_location_id, from_warehouse_id, lot_id, sku, qty,
   qty_before, qty_after, doc_type, doc_id, doc_line_id, reason_code, note, actor, reverses_movement_id, period, created_at,
   into_inspect, from_inspect`
 
@@ -77,7 +77,8 @@ function movementStatement(m: StockMovement, qtyBefore: number, qtyAfter: number
   return {
     sql: `INSERT INTO stock_movements (${MOVEMENT_COLS}) VALUES (${MOVEMENT_COLS.split(',').map(() => '?').join(', ')})`,
     bind: [
-      m.movement_no ?? null, m.type, m.warehouse_id, m.location_id, m.from_location_id ?? null, m.lot_id,
+      m.movement_no ?? null, m.type, m.warehouse_id, m.location_id, m.from_location_id ?? null,
+      m.from_warehouse_id ?? null, m.lot_id,
       m.sku, m.qty, qtyBefore, qtyAfter, m.doc_type ?? null, m.doc_id ?? null, m.doc_line_id ?? null,
       m.reason_code ?? null, m.note ?? null, m.actor ?? 'local', m.reverses_movement_id ?? null,
       m.period ?? null, m.created_at ?? at, m.into_inspect ? 1 : 0, m.from_inspect ? 1 : 0,
@@ -93,6 +94,7 @@ async function loadMovement(exec: LedgerExec, id: number): Promise<StockMovement
     warehouse_id: (r.warehouse_id as number | null) ?? null,
     location_id: (r.location_id as number | null) ?? null,
     from_location_id: (r.from_location_id as number | null) ?? null,
+    from_warehouse_id: (r.from_warehouse_id as number | null) ?? null,
     lot_id: (r.lot_id as number | null) ?? null,
     sku: String(r.sku ?? ''),
     type: r.type as StockMovement['type'],
@@ -132,6 +134,19 @@ export async function recordMovement(exec: LedgerExec, m: StockMovement): Promis
     statements.push(movementStatement(m, src.on_hand, srcNext.on_hand, at))
     statements.push(balanceStatement(srcRow, srcNext, at))
     if (!dstRow || !srcRow || dstRow.id !== srcRow.id) statements.push(balanceStatement(dstRow, dstNext, at))
+  } else if (m.type === 'TRANSFER_IN' && m.from_location_id != null) {
+    // GĐ3: nhận chuyển kho hai phía — nguồn (from_warehouse_id/from_location_id):
+    // in_transit-; đích (warehouse_id/location_id): on_hand+. Khớp rebuildBalances.
+    const srcM: StockMovement = { ...m, warehouse_id: m.from_warehouse_id ?? m.warehouse_id }
+    const srcRow = await findBalanceRow(exec, srcM, m.from_location_id)
+    const src = toBalance(srcRow, srcM, m.from_location_id)
+    const srcNext = applyBucketDelta(src, { in_transit: -m.qty }, 'TRANSFER_IN (trừ nguồn)')
+    const dstRow = await findBalanceRow(exec, m, m.location_id)
+    const dst = toBalance(dstRow, m, m.location_id)
+    const dstNext = applyBucketDelta(dst, { on_hand: m.qty }, 'TRANSFER_IN (cộng đích)')
+    statements.push(movementStatement(m, src.on_hand, srcNext.on_hand, at))
+    statements.push(balanceStatement(srcRow, srcNext, at))
+    statements.push(balanceStatement(dstRow, dstNext, at))
   } else if (m.type === 'PUTAWAY' && m.from_location_id != null && m.from_location_id !== m.location_id) {
     // GĐ1: putaway từ khu nhận sang vị trí đích — nguồn: on_hand- và inspect-;
     // đích: on_hand+ (khả dụng). Cùng vị trí thì rơi xuống nhánh thường (inspect-).

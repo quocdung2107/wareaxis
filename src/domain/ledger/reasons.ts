@@ -17,6 +17,10 @@ export const ADJUSTMENT_REASONS: readonly AdjustmentReason[] = [
   { code: 'FOUND', name: 'Tìm thấy hàng (tăng tồn)', requires_approval: true },
   { code: 'INPUT_ERROR', name: 'Sai sót nhập liệu', requires_approval: false },
   { code: 'RETURN_QC', name: 'Hàng trả không đạt kiểm tra', requires_approval: false },
+  // GĐ3: lý do đóng băng (FREEZE) — FREEZE không thuộc nhóm REASON_REQUIRED của
+  // ledger, nhưng tầng nghiệp vụ ops/freeze bắt buộc chọn một mã trong danh mục.
+  { code: 'QUALITY_HOLD', name: 'Đóng băng chờ kiểm tra chất lượng', requires_approval: false },
+  { code: 'DAMAGE_SUSPECT', name: 'Nghi hỏng — đóng băng chờ xử lý', requires_approval: false },
 ] as const
 
 export const REASON_CODES: ReadonlySet<string> = new Set(ADJUSTMENT_REASONS.map((r) => r.code))

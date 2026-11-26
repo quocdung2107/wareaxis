@@ -189,6 +189,37 @@ export function initSchema() {
         qty_qc_pass REAL NOT NULL DEFAULT 0, qty_qc_fail REAL NOT NULL DEFAULT 0, qty_putaway REAL NOT NULL DEFAULT 0,
         qc_status TEXT NOT NULL DEFAULT 'PENDING', reason TEXT, damage_reason_code TEXT)` },
       { sql: 'CREATE INDEX IF NOT EXISTS idx_return_lines_return ON return_lines(return_id)' },
+      // ===== GĐ3 (kế hoạch v2 Phần 3 GĐ3): vận hành kho — kiểm kê quay vòng / đóng băng /
+      // chuyển kho / gợi ý đặt hàng / cảnh báo. Cycle count CHỈ cho hàng ledger
+      // (lots + stock_balances); phiếu kiểm mù cũ trên inventory_rows (count_sessions)
+      // giữ nguyên, không liên quan. stock_policies dùng lại bảng GĐ0 (đủ cột cần thiết).
+      { sql: 'CREATE TABLE IF NOT EXISTS count_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL)' },
+      { sql: 'INSERT OR IGNORE INTO count_counter (id, n) VALUES (1, 0)' },
+      { sql: `CREATE TABLE IF NOT EXISTS cycle_counts (id INTEGER PRIMARY KEY AUTOINCREMENT, count_no TEXT UNIQUE NOT NULL,
+        scope_type TEXT NOT NULL, scope_location_id INTEGER, scope_zone_id INTEGER, scope_sku TEXT,
+        warehouse_id INTEGER, blind INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'OPEN',
+        note TEXT, counted_by TEXT, counted_at TEXT, approved_by TEXT, approved_at TEXT,
+        created_at TEXT, created_by TEXT)` },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_cycle_counts_status ON cycle_counts(status)' },
+      { sql: `CREATE TABLE IF NOT EXISTS cycle_count_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, count_id INTEGER NOT NULL,
+        warehouse_id INTEGER, location_id INTEGER, lot_id INTEGER, sku TEXT NOT NULL,
+        expected_qty REAL NOT NULL DEFAULT 0, hold_qty REAL NOT NULL DEFAULT 0, inspect_qty REAL NOT NULL DEFAULT 0,
+        counted_qty REAL, variance REAL, counted_at TEXT, counted_by TEXT)` },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_cycle_tasks_count ON cycle_count_tasks(count_id)' },
+      { sql: 'CREATE TABLE IF NOT EXISTS transfer_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL)' },
+      { sql: 'INSERT OR IGNORE INTO transfer_counter (id, n) VALUES (1, 0)' },
+      { sql: `CREATE TABLE IF NOT EXISTS transfer_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, transfer_no TEXT UNIQUE NOT NULL,
+        from_warehouse_id INTEGER, to_warehouse_id INTEGER, status TEXT NOT NULL DEFAULT 'DRAFT', note TEXT,
+        created_at TEXT, created_by TEXT, shipped_at TEXT, shipped_by TEXT, received_at TEXT, received_by TEXT)` },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_transfer_status ON transfer_orders(status)' },
+      { sql: `CREATE TABLE IF NOT EXISTS transfer_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, transfer_id INTEGER NOT NULL,
+        sku TEXT NOT NULL, lot_id INTEGER, from_location_id INTEGER, to_location_id INTEGER, qty REAL NOT NULL)` },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_transfer_lines_order ON transfer_lines(transfer_id)' },
+      { sql: `CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, alert_key TEXT UNIQUE NOT NULL,
+        type TEXT NOT NULL, severity TEXT NOT NULL DEFAULT 'INFO', sku TEXT, lot_id INTEGER, location_id INTEGER,
+        message TEXT, status TEXT NOT NULL DEFAULT 'NEW', created_at TEXT, updated_at TEXT,
+        ack_by TEXT, ack_at TEXT, resolved_at TEXT)` },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status, severity)' },
     ])
     // DB cũ: picks chưa có cột pick_order_id -> thêm (không mất dữ liệu cũ).
     const cols = (await query('PRAGMA table_info(picks)')).map((c) => String(c.name))
@@ -207,7 +238,14 @@ export function initSchema() {
     const mvAdds: string[] = []
     if (!mvCols.includes('into_inspect')) mvAdds.push('ALTER TABLE stock_movements ADD COLUMN into_inspect INTEGER NOT NULL DEFAULT 0')
     if (!mvCols.includes('from_inspect')) mvAdds.push('ALTER TABLE stock_movements ADD COLUMN from_inspect INTEGER NOT NULL DEFAULT 0')
+    // GĐ3: kho nguồn của TRANSFER_IN hai phía (chuyển kho).
+    if (!mvCols.includes('from_warehouse_id')) mvAdds.push('ALTER TABLE stock_movements ADD COLUMN from_warehouse_id INTEGER')
     if (mvAdds.length) await batch(mvAdds.map((sql) => ({ sql })))
+    // GĐ3: NCC mặc định của sản phẩm (cho gợi ý đặt hàng gom theo NCC).
+    const prodCols = (await query('PRAGMA table_info(products)')).map((c) => String(c.name))
+    if (!prodCols.includes('default_supplier_id')) {
+      await batch([{ sql: 'ALTER TABLE products ADD COLUMN default_supplier_id INTEGER' }])
+    }
     // GĐ1: seed kho mặc định + khu + vị trí nhận/cất — CHỈ khi chưa có kho nào.
     // Đã có dữ liệu (kể cả người dùng sửa) thì không đụng vào.
     const [{ n: nWh }] = await query('SELECT COUNT(*) AS n FROM warehouses')
@@ -230,13 +268,13 @@ export function initSchema() {
     }
     const [{ n }] = await query('SELECT COUNT(*) AS n FROM uom_map')
     if (n === 0) await batch(Object.entries(DEFAULT_UOM).map(([k, v]) => ({ sql: 'INSERT INTO uom_map VALUES (?, ?)', bind: [k, v] })))
-    const [{ n: nReasons }] = await query('SELECT COUNT(*) AS n FROM adjustment_reasons')
-    if (nReasons === 0) {
-      await batch(ADJUSTMENT_REASONS.map((r) => ({
-        sql: 'INSERT OR IGNORE INTO adjustment_reasons (code, name, requires_approval) VALUES (?, ?, ?)',
-        bind: [r.code, r.name, r.requires_approval ? 1 : 0],
-      })))
-    }
+    // Seed danh mục lý do: INSERT OR IGNORE mỗi lần init — DB cũ tự bổ sung mã
+    // mới của các giai đoạn sau (GĐ3: QUALITY_HOLD / DAMAGE_SUSPECT cho đóng băng;
+    // COUNT_VARIANCE đã có từ GĐ0) mà không ghi đè tên người dùng đã sửa.
+    await batch(ADJUSTMENT_REASONS.map((r) => ({
+      sql: 'INSERT OR IGNORE INTO adjustment_reasons (code, name, requires_approval) VALUES (?, ?, ?)',
+      bind: [r.code, r.name, r.requires_approval ? 1 : 0],
+    })))
   })()
   return schemaReady
 }

@@ -106,10 +106,33 @@ CREATE TABLE IF NOT EXISTS shipment_items (id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS returns (id INTEGER PRIMARY KEY AUTOINCREMENT, return_no TEXT UNIQUE NOT NULL, shipment_id INTEGER, order_id INTEGER, customer_name TEXT, status TEXT NOT NULL DEFAULT 'RECEIVED', note TEXT, created_at TEXT, created_by TEXT);
 CREATE TABLE IF NOT EXISTS return_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, return_id INTEGER NOT NULL, shipment_item_id INTEGER, sku TEXT NOT NULL, lot_id INTEGER, qty_returned REAL NOT NULL, qty_qc_pass REAL NOT NULL DEFAULT 0, qty_qc_fail REAL NOT NULL DEFAULT 0, qty_putaway REAL NOT NULL DEFAULT 0, qc_status TEXT NOT NULL DEFAULT 'PENDING', reason TEXT, damage_reason_code TEXT);
 `)
+
+// Schema GĐ3 (tương đương phần GĐ3 trong src/shared/inventory/repo.ts):
+// cycle_counts/cycle_count_tasks (chỉ hàng ledger), transfer_orders/lines,
+// alerts. stock_policies dùng lại bảng GĐ0.
+db.exec(`
+CREATE TABLE IF NOT EXISTS count_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO count_counter (id, n) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS cycle_counts (id INTEGER PRIMARY KEY AUTOINCREMENT, count_no TEXT UNIQUE NOT NULL, scope_type TEXT NOT NULL, scope_location_id INTEGER, scope_zone_id INTEGER, scope_sku TEXT, warehouse_id INTEGER, blind INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'OPEN', note TEXT, counted_by TEXT, counted_at TEXT, approved_by TEXT, approved_at TEXT, created_at TEXT, created_by TEXT);
+CREATE INDEX IF NOT EXISTS idx_cycle_counts_status ON cycle_counts(status);
+CREATE TABLE IF NOT EXISTS cycle_count_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, count_id INTEGER NOT NULL, warehouse_id INTEGER, location_id INTEGER, lot_id INTEGER, sku TEXT NOT NULL, expected_qty REAL NOT NULL DEFAULT 0, hold_qty REAL NOT NULL DEFAULT 0, inspect_qty REAL NOT NULL DEFAULT 0, counted_qty REAL, variance REAL, counted_at TEXT, counted_by TEXT);
+CREATE INDEX IF NOT EXISTS idx_cycle_tasks_count ON cycle_count_tasks(count_id);
+CREATE TABLE IF NOT EXISTS transfer_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO transfer_counter (id, n) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS transfer_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, transfer_no TEXT UNIQUE NOT NULL, from_warehouse_id INTEGER, to_warehouse_id INTEGER, status TEXT NOT NULL DEFAULT 'DRAFT', note TEXT, created_at TEXT, created_by TEXT, shipped_at TEXT, shipped_by TEXT, received_at TEXT, received_by TEXT);
+CREATE INDEX IF NOT EXISTS idx_transfer_status ON transfer_orders(status);
+CREATE TABLE IF NOT EXISTS transfer_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, transfer_id INTEGER NOT NULL, sku TEXT NOT NULL, lot_id INTEGER, from_location_id INTEGER, to_location_id INTEGER, qty REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, alert_key TEXT UNIQUE NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL DEFAULT 'INFO', sku TEXT, lot_id INTEGER, location_id INTEGER, message TEXT, status TEXT NOT NULL DEFAULT 'NEW', created_at TEXT, updated_at TEXT, ack_by TEXT, ack_at TEXT, resolved_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status, severity);
+`)
 {
   const cols = db.prepare('PRAGMA table_info(stock_movements)').all().map((c) => c.name)
   if (!cols.includes('into_inspect')) db.exec('ALTER TABLE stock_movements ADD COLUMN into_inspect INTEGER NOT NULL DEFAULT 0')
   if (!cols.includes('from_inspect')) db.exec('ALTER TABLE stock_movements ADD COLUMN from_inspect INTEGER NOT NULL DEFAULT 0')
+  // GĐ3: kho nguồn của TRANSFER_IN hai phía (chuyển kho).
+  if (!cols.includes('from_warehouse_id')) db.exec('ALTER TABLE stock_movements ADD COLUMN from_warehouse_id INTEGER')
+  const prodCols = db.prepare('PRAGMA table_info(products)').all().map((c) => c.name)
+  if (!prodCols.includes('default_supplier_id')) db.exec('ALTER TABLE products ADD COLUMN default_supplier_id INTEGER')
 }
 
 const REASONS = [
@@ -117,6 +140,9 @@ const REASONS = [
   ['EXPIRED', 'Hết hạn dùng', 0], ['LOST', 'Thất lạc / mất hàng', 1],
   ['FOUND', 'Tìm thấy hàng (tăng tồn)', 1], ['INPUT_ERROR', 'Sai sót nhập liệu', 0],
   ['RETURN_QC', 'Hàng trả không đạt kiểm tra', 0],
+  // GĐ3: lý do đóng băng (FREEZE) — nguồn: src/domain/ledger/reasons.ts.
+  ['QUALITY_HOLD', 'Đóng băng chờ kiểm tra chất lượng', 0],
+  ['DAMAGE_SUSPECT', 'Nghi hỏng — đóng băng chờ xử lý', 0],
 ]
 const insReason = db.prepare('INSERT OR IGNORE INTO adjustment_reasons (code, name, requires_approval) VALUES (?, ?, ?)')
 for (const r of REASONS) insReason.run(...r)
@@ -246,8 +272,12 @@ function applyToBalance(cur, m) {
       if (b.on_hand + EPS < q) throw new Error('WRITE_OFF vượt tồn vật lý')
       b.damaged -= Math.min(b.damaged, q); b.on_hand -= q; break
     }
-    case 'MOVE': case 'REVERSAL':
-      throw new Error(`${m.type} chưa hỗ trợ qua API ở bản GĐ-LAN (MOVE hai phía / REVERSAL làm ở GĐ sau)`)
+    case 'MOVE':
+      // MOVE hai phía được xử lý riêng trong applyMovementTxn; vào tới đây là
+      // MOVE cùng vị trí (chỉ ghi sổ, số dư không đổi) — port recordMovement client.
+      break
+    case 'REVERSAL':
+      throw new Error('REVERSAL chưa hỗ trợ qua API (làm ở tầng client/scripts đối chiếu)')
     default: throw new Error(`Loại movement không rõ: ${m.type}`)
   }
   for (const k of Object.keys(b)) b[k] = r6(b[k])
@@ -283,13 +313,39 @@ function applyMovementTxn(m, actor) {
     // GĐ1: PUTAWAY khác vị trí = hai phía: nguồn {on_hand-, inspect-}, đích {on_hand+}.
     const crossPutaway = m.type === 'PUTAWAY' && m.from_location_id != null && m.location_id != null
       && Number(m.from_location_id) !== Number(m.location_id)
-    const insertMovement = (qtyBefore, qtyAfter) => db.prepare(`INSERT INTO stock_movements (movement_no, type, warehouse_id, location_id, from_location_id, lot_id, sku, qty,
+    // GĐ3: MOVE khác vị trí = hai phía {on_hand- nguồn, on_hand+ đích};
+    // TRANSFER_IN có from_location_id = hai phía {in_transit- nguồn, on_hand+ đích}.
+    const crossMove = m.type === 'MOVE' && m.from_location_id != null && m.location_id != null
+      && Number(m.from_location_id) !== Number(m.location_id)
+    const crossTransferIn = m.type === 'TRANSFER_IN' && m.from_location_id != null && m.location_id != null
+    const insertMovement = (qtyBefore, qtyAfter) => db.prepare(`INSERT INTO stock_movements (movement_no, type, warehouse_id, location_id, from_location_id, from_warehouse_id, lot_id, sku, qty,
       qty_before, qty_after, doc_type, doc_id, doc_line_id, reason_code, note, actor, reverses_movement_id, period, created_at, into_inspect, from_inspect)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(m.movement_no ?? null, m.type, m.warehouse_id ?? null, m.location_id ?? null, m.from_location_id ?? null,
+        m.from_warehouse_id ?? null,
         m.lot_id ?? null, String(m.sku), m.qty, qtyBefore, qtyAfter, m.doc_type ?? null, m.doc_id ?? null,
         m.doc_line_id ?? null, m.reason_code ?? null, m.note ?? null, actor, m.reverses_movement_id ?? null, m.period ?? null, at,
         m.into_inspect ? 1 : 0, m.from_inspect ? 1 : 0)
+    if (crossMove || crossTransferIn) {
+      const srcKey = crossTransferIn
+        ? { ...m, warehouse_id: m.from_warehouse_id ?? m.warehouse_id }
+        : m
+      const srcRow = findBalance(srcKey, m.from_location_id)
+      const srcCur = bucketsOf(srcRow)
+      const srcNext = crossTransferIn
+        ? { ...srcCur, in_transit: r6(srcCur.in_transit - m.qty) }
+        : { ...srcCur, on_hand: r6(srcCur.on_hand - m.qty) }
+      assertNonNegative(srcNext, m.type)
+      const dstRow = findBalance(m, m.location_id)
+      const dstCur = bucketsOf(dstRow)
+      const dstNext = { ...dstCur, on_hand: r6(dstCur.on_hand + m.qty) }
+      assertNonNegative(dstNext, m.type)
+      const info = insertMovement(dstCur.on_hand, dstNext.on_hand)
+      saveBalance(srcRow, { ...emptyBalance(srcKey, m.from_location_id), ...srcNext }, at)
+      saveBalance(dstRow, { ...emptyBalance(m, m.location_id), ...dstNext }, at)
+      db.exec('COMMIT')
+      return { id: Number(info.lastInsertRowid), balance: { ...emptyBalance(m, m.location_id), ...dstNext, available: availableOf(dstNext) } }
+    }
     if (crossPutaway) {
       const srcRow = findBalance(m, m.from_location_id)
       const srcCur = bucketsOf(srcRow)
@@ -471,6 +527,182 @@ function refreshReturnS(returnId, changedLineId) {
       db.prepare('UPDATE lots SET status = ? WHERE lot_id = ?').run(lotStatusAfterS(adapted), line.lot_id)
     }
   }
+}
+
+// ---------- Vận hành kho GĐ3 (port từ src/domain/ops/* — giữ khớp bản TS) ----------
+const movableOf = (b) => Math.max(0, availableOf(b))
+function findBalanceRowS(warehouseId, locationId, lotId, sku) {
+  return db.prepare(`SELECT * FROM stock_balances WHERE warehouse_id IS ? AND location_id IS ? AND lot_id IS ?
+    AND UPPER(TRIM(sku)) = UPPER(TRIM(?))`).get(warehouseId ?? null, locationId ?? null, lotId ?? null, String(sku))
+}
+function getCycleCountFull(id) {
+  const count = db.prepare('SELECT * FROM cycle_counts WHERE id = ?').get(id)
+  if (!count) return null
+  const tasks = db.prepare(`SELECT t.*, COALESCE(loc.code, '') AS location_code FROM cycle_count_tasks t
+    LEFT JOIN locations loc ON loc.id = t.location_id WHERE t.count_id = ? ORDER BY loc.pick_sequence, t.sku, t.lot_id`).all(id)
+  return { count, tasks }
+}
+function getTransferFull(id) {
+  const order = db.prepare('SELECT * FROM transfer_orders WHERE id = ?').get(id)
+  if (!order) return null
+  const lines = db.prepare('SELECT * FROM transfer_lines WHERE transfer_id = ? ORDER BY id').all(id)
+  return { order, lines }
+}
+/** Tạo PO (DRAFT) — dùng cho replenishment create-pos; handler PO thường giữ nguyên. */
+function createPoS({ supplier_id, warehouse_id, note, lines }, actor) {
+  const at = nowStamp()
+  const total = r6(lines.reduce((sum, l) => sum + Number(l.qty_ordered) * (Number(l.unit_price) || 0), 0))
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    db.prepare('UPDATE po_counter SET n = n + 1 WHERE id = 1').run()
+    const info = db.prepare(`INSERT INTO purchase_orders (po_no, supplier_id, warehouse_id, expected_date, status, total_amount, note, created_at, updated_at, created_by)
+      VALUES ((SELECT 'PO-' || printf('%04d', n) FROM po_counter WHERE id = 1), ?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)`)
+      .run(supplier_id ?? null, warehouse_id ?? defaultWarehouseId(), null, total, note ?? null, at, at, actor)
+    const poId = Number(info.lastInsertRowid)
+    const upsertProduct = db.prepare(`INSERT INTO products (sku, name, uom, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(sku) DO UPDATE SET name = COALESCE(NULLIF(excluded.name, ''), products.name), updated_at = excluded.updated_at`)
+    const insLine = db.prepare(`INSERT INTO po_lines (po_id, product_id, sku, description, uom, qty_ordered, unit_price, expected_batch, note)
+      VALUES (?, (SELECT id FROM products WHERE sku = ?), ?, ?, ?, ?, ?, ?, ?)`)
+    for (const l of lines) {
+      const sku = String(l.sku).trim()
+      upsertProduct.run(sku, l.description ?? '', l.uom ?? '', at, at)
+      insLine.run(poId, sku, sku, l.description ?? null, l.uom ?? null, Number(l.qty_ordered),
+        l.unit_price == null ? null : Number(l.unit_price), null, null)
+    }
+    db.exec('COMMIT')
+    return { id: poId, po_no: db.prepare('SELECT po_no FROM purchase_orders WHERE id = ?').get(poId).po_no }
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+}
+/** Gợi ý đặt hàng (port computeSuggestions + groupBySupplier). */
+function computeReplenishmentS() {
+  const policies = db.prepare('SELECT * FROM stock_policies ORDER BY sku').all()
+  const balances = db.prepare('SELECT * FROM stock_balances').all()
+  const avail = new Map()
+  for (const b of balances) {
+    const k = `${b.warehouse_id ?? ''}\u0001${String(b.sku).trim().toUpperCase()}`
+    avail.set(k, r6((avail.get(k) ?? 0) + availableOf(b)))
+  }
+  const onOrder = new Map()
+  const ooRows = db.prepare(`SELECT po.warehouse_id AS warehouse_id, l.sku AS sku, SUM(l.qty_ordered - l.qty_received) AS pending
+    FROM po_lines l JOIN purchase_orders po ON po.id = l.po_id
+    WHERE po.status IN ('DRAFT', 'SENT', 'PARTIAL') GROUP BY po.warehouse_id, l.sku`).all()
+  for (const r of ooRows) {
+    onOrder.set(`${r.warehouse_id ?? ''}\u0001${String(r.sku).trim().toUpperCase()}`, Math.max(0, r6(Number(r.pending) || 0)))
+  }
+  const suggestions = []
+  for (const p of policies) {
+    const min = p.min_qty ?? null; const max = p.max_qty ?? null; const point = p.reorder_point ?? null
+    if (min == null && point == null) continue
+    const k = `${p.warehouse_id ?? ''}\u0001${String(p.sku).trim().toUpperCase()}`
+    const available = r6(avail.get(k) ?? 0)
+    const onOrd = r6(onOrder.get(k) ?? 0)
+    const triggered = point != null ? available <= point : available < (min ?? 0)
+    if (!triggered) continue
+    const target = max ?? (point != null && p.reorder_qty != null ? r6(point + p.reorder_qty) : (max ?? point ?? min ?? 0))
+    const suggested = r6(target - available - onOrd)
+    if (suggested <= 0) continue
+    suggestions.push({
+      sku: p.sku, warehouse_id: p.warehouse_id, available, on_order: onOrd,
+      min_qty: min, max_qty: max, reorder_point: point, suggested_qty: suggested,
+    })
+  }
+  suggestions.sort((a, b) => String(a.sku).localeCompare(String(b.sku)))
+  const prodRows = db.prepare('SELECT sku, default_supplier_id FROM products').all()
+  const supName = new Map(db.prepare('SELECT id, name FROM suppliers').all().map((s) => [s.id, s.name]))
+  const supBySku = new Map(prodRows.map((pr) => [String(pr.sku).trim().toUpperCase(),
+    pr.default_supplier_id != null ? { supplier_id: pr.default_supplier_id, supplier_name: supName.get(pr.default_supplier_id) ?? '' } : null]))
+  const groupsMap = new Map()
+  for (const s of suggestions) {
+    const sup = supBySku.get(String(s.sku).trim().toUpperCase()) ?? null
+    const key = sup ? `sup:${sup.supplier_id}` : 'none'
+    if (!groupsMap.has(key)) {
+      groupsMap.set(key, { supplier_id: sup ? sup.supplier_id : null, supplier_name: sup ? sup.supplier_name : 'Chưa rõ NCC', lines: [] })
+    }
+    groupsMap.get(key).lines.push(s)
+  }
+  const groups = [...groupsMap.values()].sort((a, b) => {
+    if (a.supplier_id == null) return 1
+    if (b.supplier_id == null) return -1
+    return String(a.supplier_name).localeCompare(String(b.supplier_name))
+  })
+  return { suggestions, groups }
+}
+/** Quét cảnh báo (port scanAlerts; PENDING_QC dùng inspect > 0 đơn thuần). */
+function scanAlertsS(today) {
+  const lots = db.prepare('SELECT lot_id, sku, expiry_date FROM lots').all()
+  const balances = db.prepare('SELECT * FROM stock_balances').all()
+  const policies = db.prepare('SELECT * FROM stock_policies').all()
+  const out = []
+  const keyOf = (type, sku, lotId, locationId) => `${type}:${String(sku).trim().toUpperCase()}:${lotId ?? ''}:${locationId ?? ''}`
+  const parseDay = (s) => { const [y, m, d] = String(s).split('-').map(Number); return Date.UTC(y, (m || 1) - 1, d || 1) / 86400000 }
+  const onHandByLot = new Map()
+  for (const b of balances) {
+    if (b.lot_id == null) continue
+    onHandByLot.set(b.lot_id, r6((onHandByLot.get(b.lot_id) ?? 0) + b.on_hand))
+  }
+  for (const lot of lots) {
+    const expiry = lot.expiry_date ? String(lot.expiry_date).trim() : ''
+    if (!expiry) continue
+    const onHand = onHandByLot.get(lot.lot_id) ?? 0
+    if (onHand <= 0) continue
+    const days = Math.round(parseDay(expiry) - parseDay(today))
+    let type = null; let severity = 'INFO'
+    if (days < 0) { type = 'EXPIRY_EXPIRED'; severity = 'CRITICAL' }
+    else if (days <= 7) { type = 'EXPIRY_7'; severity = 'CRITICAL' }
+    else if (days <= 15) { type = 'EXPIRY_15'; severity = 'WARN' }
+    else if (days <= 30) { type = 'EXPIRY_30'; severity = 'INFO' }
+    if (!type) continue
+    out.push({
+      alert_key: keyOf(type, lot.sku, lot.lot_id, null), type, severity, sku: lot.sku, lot_id: lot.lot_id, location_id: null,
+      message: days < 0
+        ? `Lô ${lot.lot_id} (${lot.sku}) đã hết hạn ngày ${expiry}, còn tồn vật lý ${onHand}`
+        : `Lô ${lot.lot_id} (${lot.sku}) hết hạn ngày ${expiry} (còn ${days} ngày), còn tồn vật lý ${onHand}`,
+    })
+  }
+  for (const b of balances) {
+    if (b.inspect > 0) {
+      out.push({
+        alert_key: keyOf('PENDING_QC', b.sku, b.lot_id, b.location_id), type: 'PENDING_QC', severity: 'WARN',
+        sku: b.sku, lot_id: b.lot_id, location_id: b.location_id,
+        message: `${b.sku} còn ${b.inspect} đang chờ QC tại vị trí ${b.location_id ?? '—'} (lô ${b.lot_id ?? '—'})`,
+      })
+    }
+    if (b.hold > 0) {
+      out.push({
+        alert_key: keyOf('FROZEN_STOCK', b.sku, b.lot_id, b.location_id), type: 'FROZEN_STOCK', severity: 'INFO',
+        sku: b.sku, lot_id: b.lot_id, location_id: b.location_id,
+        message: `${b.sku} đang đóng băng ${b.hold} tại vị trí ${b.location_id ?? '—'} (lô ${b.lot_id ?? '—'})`,
+      })
+    }
+  }
+  const availByWhSku = new Map()
+  for (const b of balances) {
+    const k = `${b.warehouse_id ?? ''}\u0001${String(b.sku).trim().toUpperCase()}`
+    availByWhSku.set(k, r6((availByWhSku.get(k) ?? 0) + availableOf(b)))
+  }
+  for (const p of policies) {
+    const threshold = p.min_qty ?? p.reorder_point ?? null
+    if (threshold == null) continue
+    const available = availByWhSku.get(`${p.warehouse_id ?? ''}\u0001${String(p.sku).trim().toUpperCase()}`) ?? 0
+    if (available <= 0) {
+      out.push({
+        alert_key: keyOf('OUT_OF_STOCK', p.sku, null, null), type: 'OUT_OF_STOCK', severity: 'CRITICAL',
+        sku: p.sku, lot_id: null, location_id: null,
+        message: `${p.sku} đã hết hàng khả dụng (mức min ${threshold})`,
+      })
+    } else if (available < threshold) {
+      out.push({
+        alert_key: keyOf('LOW_STOCK', p.sku, null, null), type: 'LOW_STOCK', severity: 'WARN',
+        sku: p.sku, lot_id: null, location_id: null,
+        message: `${p.sku} tồn khả dụng ${available} dưới mức min ${threshold}`,
+      })
+    }
+  }
+  const rank = { CRITICAL: 0, WARN: 1, INFO: 2 }
+  return out.sort((a, b) => rank[a.severity] - rank[b.severity] || a.alert_key.localeCompare(b.alert_key))
 }
 
 // ---------- Router ----------
@@ -1446,6 +1678,550 @@ const server = http.createServer(async (req, res) => {
       const rows = db.prepare('SELECT * FROM returns ORDER BY id DESC').all()
         .map((r) => ({ ...r, lines: db.prepare('SELECT * FROM return_lines WHERE return_id = ? ORDER BY id').all(r.id) }))
       return sendJson(res, 200, { returns: rows })
+    }
+
+    // --- Vận hành kho GĐ3: kiểm kê quay vòng / đóng băng / chuyển kho / replenishment / cảnh báo ---
+    // Endpoint hỗ trợ tối thiểu: tạo kho + vị trí (client có createLocation ở
+    // purchase.ts; server cần tương đương để dựng kho đích cho chuyển kho).
+    if (p === '/api/warehouses' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_transfer')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_transfer' })
+      const body = await readBody(req)
+      const code = String(body.code || '').trim().toUpperCase()
+      const name = String(body.name || '').trim()
+      if (!code || !name) return sendJson(res, 400, { error: 'invalid_warehouse', message: 'Kho cần mã và tên' })
+      if (db.prepare('SELECT id FROM warehouses WHERE UPPER(code) = ?').get(code)) {
+        return sendJson(res, 400, { error: 'invalid_warehouse', message: `Mã kho ${code} đã tồn tại` })
+      }
+      const at = nowStamp()
+      const info = db.prepare('INSERT INTO warehouses (code, name, address, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(code, name, body.address ?? null, at, at, s.username)
+      return sendJson(res, 201, { id: Number(info.lastInsertRowid), code, name })
+    }
+    if (p === '/api/locations' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_transfer')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_transfer' })
+      const body = await readBody(req)
+      const code = String(body.code || '').trim().toUpperCase()
+      if (!code || !body.warehouse_id) return sendJson(res, 400, { error: 'invalid_location', message: 'Vị trí cần mã và kho' })
+      if (db.prepare('SELECT id FROM locations WHERE warehouse_id = ? AND UPPER(code) = ?').get(Number(body.warehouse_id), code)) {
+        return sendJson(res, 400, { error: 'invalid_location', message: `Vị trí ${code} đã tồn tại trong kho này` })
+      }
+      const info = db.prepare('INSERT INTO locations (warehouse_id, zone_id, code, loc_type, pick_sequence) VALUES (?, ?, ?, ?, ?)')
+        .run(Number(body.warehouse_id), body.zone_id ?? null, code, body.loc_type ?? 'PICKABLE', body.pick_sequence ?? null)
+      return sendJson(res, 201, { id: Number(info.lastInsertRowid), code })
+    }
+    if (p === '/api/suppliers' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      return sendJson(res, 200, { suppliers: db.prepare('SELECT * FROM suppliers ORDER BY name COLLATE NOCASE, code').all() })
+    }
+    if (p === '/api/suppliers' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'purchase_create')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền purchase_create' })
+      const body = await readBody(req)
+      const code = String(body.code || '').trim().toUpperCase()
+      const name = String(body.name || '').trim()
+      if (!code || !name) return sendJson(res, 400, { error: 'invalid_supplier', message: 'NCC cần mã và tên' })
+      const dup = db.prepare('SELECT id FROM suppliers WHERE UPPER(code) = ?').get(code)
+      if (dup) return sendJson(res, 400, { error: 'invalid_supplier', message: `Mã NCC ${code} đã tồn tại` })
+      const info = db.prepare('INSERT INTO suppliers (code, name, contact, phone, email, address, tax_code, lead_time_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(code, name, body.contact ?? null, body.phone ?? null, body.email ?? null, body.address ?? null, body.tax_code ?? null, body.lead_time_days ?? null)
+      return sendJson(res, 201, { id: Number(info.lastInsertRowid), code, name })
+    }
+    if (p === '/api/products/default-supplier' && req.method === 'PUT') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'purchase_create')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền purchase_create' })
+      const body = await readBody(req)
+      const sku = String(body.sku || '').trim()
+      if (!sku) return sendJson(res, 400, { error: 'invalid_product', message: 'Thiếu SKU' })
+      const at = nowStamp()
+      db.prepare(`INSERT INTO products (sku, default_supplier_id, created_at, updated_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(sku) DO UPDATE SET default_supplier_id = excluded.default_supplier_id, updated_at = excluded.updated_at`)
+        .run(sku, body.supplier_id ?? null, at, at)
+      return sendJson(res, 200, { sku, default_supplier_id: body.supplier_id ?? null })
+    }
+
+    if (p === '/api/cycle-counts' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const rows = db.prepare(`SELECT c.*, (SELECT COUNT(*) FROM cycle_count_tasks t WHERE t.count_id = c.id) AS task_count
+        FROM cycle_counts c ORDER BY c.id DESC`).all()
+      return sendJson(res, 200, { cycle_counts: rows })
+    }
+    if (p === '/api/cycle-counts' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_count')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_count' })
+      const body = await readBody(req)
+      const scopeType = String(body.scope_type || 'LOCATION')
+      if (!['LOCATION', 'ZONE', 'SKU'].includes(scopeType)) {
+        return sendJson(res, 400, { error: 'invalid_scope', message: `Phạm vi kiểm không hợp lệ: ${scopeType}` })
+      }
+      const balances = db.prepare(`SELECT b.*, loc.zone_id AS zone_id FROM stock_balances b
+        LEFT JOIN locations loc ON loc.id = b.location_id`).all()
+      const inScope = (b) => {
+        if (body.warehouse_id != null && b.warehouse_id !== Number(body.warehouse_id)) return false
+        if (scopeType === 'LOCATION') return body.location_id != null && b.location_id === Number(body.location_id)
+        if (scopeType === 'ZONE') return body.zone_id != null && b.zone_id === Number(body.zone_id)
+        return !!body.sku && String(b.sku).trim().toUpperCase() === String(body.sku).trim().toUpperCase()
+      }
+      const tasks = balances.filter((b) => inScope(b) && (b.on_hand > 0 || b.hold > 0))
+        .sort((a, b) => (a.location_id ?? 0) - (b.location_id ?? 0) || String(a.sku).localeCompare(String(b.sku)) || (a.lot_id ?? 0) - (b.lot_id ?? 0))
+      if (!tasks.length) return sendJson(res, 400, { error: 'empty_scope', message: 'Phạm vi đã chọn không có dòng tồn nào để kiểm' })
+      const at = nowStamp()
+      let countId; let countNo
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        db.prepare('UPDATE count_counter SET n = n + 1 WHERE id = 1').run()
+        const info = db.prepare(`INSERT INTO cycle_counts (count_no, scope_type, scope_location_id, scope_zone_id, scope_sku, warehouse_id, blind, status, note, created_at, created_by)
+          VALUES ((SELECT 'CC-' || printf('%04d', n) FROM count_counter WHERE id = 1), ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?)`)
+          .run(scopeType, body.location_id ?? null, body.zone_id ?? null, body.sku ?? null,
+            body.warehouse_id ?? null, body.blind ? 1 : 0, body.note ?? null, at, s.username)
+        countId = Number(info.lastInsertRowid)
+        countNo = db.prepare('SELECT count_no FROM cycle_counts WHERE id = ?').get(countId).count_no
+        const insTask = db.prepare(`INSERT INTO cycle_count_tasks (count_id, warehouse_id, location_id, lot_id, sku, expected_qty, hold_qty, inspect_qty)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        for (const t of tasks) insTask.run(countId, t.warehouse_id, t.location_id, t.lot_id, t.sku, r6(t.on_hand), r6(t.hold), r6(t.inspect))
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        return sendJson(res, 400, { error: 'count_rejected', message: String(e.message || e) })
+      }
+      return sendJson(res, 201, { id: countId, count_no: countNo, task_count: tasks.length })
+    }
+    const ccIdMatch = /^\/api\/cycle-counts\/(\d+)$/.exec(p)
+    if (ccIdMatch && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const full = getCycleCountFull(Number(ccIdMatch[1]))
+      if (!full) return sendJson(res, 404, { error: 'count_not_found', message: 'Không tìm thấy phiên kiểm kê' })
+      return sendJson(res, 200, full)
+    }
+    const ccCount = /^\/api\/cycle-counts\/(\d+)\/count$/.exec(p)
+    if (ccCount && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_count')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_count' })
+      const body = await readBody(req)
+      const full = getCycleCountFull(Number(ccCount[1]))
+      if (!full) return sendJson(res, 404, { error: 'count_not_found', message: 'Không tìm thấy phiên kiểm kê' })
+      if (!['OPEN', 'COUNTED'].includes(full.count.status)) {
+        return sendJson(res, 400, { error: 'not_countable', message: `Phiên đang ở trạng thái ${full.count.status}` })
+      }
+      const entries = Array.isArray(body.entries) ? body.entries : []
+      if (!entries.length) return sendJson(res, 400, { error: 'invalid_count', message: 'Chưa có số đếm nào' })
+      const at = nowStamp()
+      for (const e of entries) {
+        const task = full.tasks.find((t) => t.id === Number(e.task_id))
+        if (!task) return sendJson(res, 400, { error: 'invalid_count', message: `Dòng kiểm ${e.task_id} không thuộc phiên này` })
+        const counted = Number(e.counted_qty)
+        if (!Number.isFinite(counted) || counted < 0) {
+          return sendJson(res, 400, { error: 'invalid_count', message: `Số đếm của ${task.sku} không hợp lệ` })
+        }
+        db.prepare('UPDATE cycle_count_tasks SET counted_qty = ?, variance = ?, counted_at = ?, counted_by = ? WHERE id = ?')
+          .run(r6(counted), r6(counted - task.expected_qty), at, s.username, task.id)
+        task.counted_qty = r6(counted)
+      }
+      const allCountedNow = full.tasks.length > 0 && full.tasks.every((t) => t.counted_qty != null)
+      if (allCountedNow) {
+        db.prepare("UPDATE cycle_counts SET status = 'COUNTED', counted_by = ?, counted_at = ? WHERE id = ?").run(s.username, at, full.count.id)
+      }
+      return sendJson(res, 200, { id: full.count.id, status: allCountedNow ? 'COUNTED' : full.count.status })
+    }
+    const ccApprove = /^\/api\/cycle-counts\/(\d+)\/approve$/.exec(p)
+    if (ccApprove && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_adjust')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_adjust' })
+      const full = getCycleCountFull(Number(ccApprove[1]))
+      if (!full) return sendJson(res, 404, { error: 'count_not_found', message: 'Không tìm thấy phiên kiểm kê' })
+      if (full.count.status !== 'COUNTED') {
+        return sendJson(res, 400, { error: 'not_approvable', message: `Chỉ duyệt được phiên đã đếm xong (đang là ${full.count.status})` })
+      }
+      // Duyệt + áp một bước: sinh ADJUST_IN/OUT (reason COUNT_VARIANCE) cho dòng lệch.
+      const movements = []
+      for (const t of full.tasks) {
+        const variance = r6((t.counted_qty ?? 0) - t.expected_qty)
+        if (variance === 0) continue
+        movements.push({
+          type: variance > 0 ? 'ADJUST_IN' : 'ADJUST_OUT', sku: t.sku, lot_id: t.lot_id, qty: Math.abs(variance),
+          warehouse_id: t.warehouse_id, location_id: t.location_id, reason_code: 'COUNT_VARIANCE',
+          doc_type: 'COUNT', doc_id: full.count.id, doc_line_id: t.id,
+          note: `Kiểm kê quay vòng: sổ ${t.expected_qty}, đếm ${t.counted_qty}`,
+        })
+      }
+      try {
+        for (const m of movements) applyMovementTxn(m, s.username)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      db.prepare("UPDATE cycle_counts SET status = 'APPLIED', approved_by = ?, approved_at = ? WHERE id = ?")
+        .run(s.username, nowStamp(), full.count.id)
+      return sendJson(res, 200, { id: full.count.id, status: 'APPLIED', movements: movements.length })
+    }
+    const ccReject = /^\/api\/cycle-counts\/(\d+)\/reject$/.exec(p)
+    if (ccReject && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_adjust')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_adjust' })
+      const full = getCycleCountFull(Number(ccReject[1]))
+      if (!full) return sendJson(res, 404, { error: 'count_not_found', message: 'Không tìm thấy phiên kiểm kê' })
+      if (!['COUNTED', 'APPROVED'].includes(full.count.status)) {
+        return sendJson(res, 400, { error: 'not_rejectable', message: `Không từ chối được phiên đang ở trạng thái ${full.count.status}` })
+      }
+      db.prepare("UPDATE cycle_counts SET status = 'REJECTED' WHERE id = ?").run(full.count.id)
+      return sendJson(res, 200, { id: full.count.id, status: 'REJECTED' })
+    }
+
+    if (p === '/api/inventory/freeze' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_adjust')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_adjust' })
+      const body = await readBody(req)
+      const qty = Number(body.qty)
+      const reason = String(body.reason_code || '').trim()
+      if (!reason) return sendJson(res, 400, { error: 'invalid_freeze', message: 'Đóng băng bắt buộc chọn lý do' })
+      if (!REASON_CODES.has(reason)) return sendJson(res, 400, { error: 'invalid_freeze', message: `Lý do không có trong danh mục: ${reason}` })
+      const row = findBalanceRowS(body.warehouse_id ?? null, body.location_id ?? null, body.lot_id ?? null, body.sku || '')
+      const avail = row ? availableOf(row) : 0
+      if (!Number.isFinite(qty) || qty <= 0 || r6(qty) > avail + EPS) {
+        return sendJson(res, 400, { error: 'invalid_freeze', message: `Đóng băng vượt tồn khả dụng tại vị trí (khả dụng ${avail})` })
+      }
+      try {
+        const out = applyMovementTxn({
+          type: 'FREEZE', sku: String(body.sku), lot_id: body.lot_id ?? null, qty,
+          warehouse_id: body.warehouse_id ?? null, location_id: body.location_id ?? null,
+          reason_code: reason, doc_type: 'MANUAL', note: body.note ?? 'Đóng băng tồn',
+        }, s.username)
+        return sendJson(res, 201, out)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+    }
+    if (p === '/api/inventory/unfreeze' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_adjust')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_adjust' })
+      const body = await readBody(req)
+      const qty = Number(body.qty)
+      const row = findBalanceRowS(body.warehouse_id ?? null, body.location_id ?? null, body.lot_id ?? null, body.sku || '')
+      const hold = row ? row.hold : 0
+      if (!Number.isFinite(qty) || qty <= 0 || r6(qty) > hold + EPS) {
+        return sendJson(res, 400, { error: 'invalid_unfreeze', message: `Mở băng vượt số đang đóng băng (${hold})` })
+      }
+      try {
+        const out = applyMovementTxn({
+          type: 'UNFREEZE', sku: String(body.sku), lot_id: body.lot_id ?? null, qty,
+          warehouse_id: body.warehouse_id ?? null, location_id: body.location_id ?? null,
+          doc_type: 'MANUAL', note: body.note ?? 'Mở băng tồn',
+        }, s.username)
+        return sendJson(res, 201, out)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+    }
+    if (p === '/api/inventory/frozen' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const rows = db.prepare('SELECT * FROM stock_balances WHERE hold > 0 ORDER BY sku, location_id, lot_id').all()
+      const freezes = db.prepare("SELECT * FROM stock_movements WHERE type = 'FREEZE' ORDER BY id DESC").all()
+      const frozen = rows.map((b) => {
+        const last = freezes.find((m) => m.warehouse_id === b.warehouse_id && m.location_id === b.location_id
+          && m.lot_id === b.lot_id && String(m.sku).trim().toUpperCase() === String(b.sku).trim().toUpperCase())
+        return {
+          ...b, available: availableOf(b),
+          reason_code: last ? last.reason_code : null, frozen_by: last ? last.actor : null,
+          frozen_at: last ? last.created_at : null, note: last ? last.note : null,
+        }
+      })
+      return sendJson(res, 200, { frozen })
+    }
+    if (p === '/api/inventory/move' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_transfer')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_transfer' })
+      const body = await readBody(req)
+      const qty = Number(body.qty)
+      const fromId = Number(body.from_location_id)
+      const toId = Number(body.to_location_id)
+      if (fromId === toId) return sendJson(res, 400, { error: 'invalid_move', message: 'Vị trí đích trùng vị trí nguồn' })
+      const dest = db.prepare('SELECT * FROM locations WHERE id = ?').get(toId)
+      if (!dest || dest.active !== 1) return sendJson(res, 400, { error: 'invalid_move', message: 'Vị trí đích không tồn tại hoặc đang tắt' })
+      const row = findBalanceRowS(body.warehouse_id ?? null, fromId, body.lot_id ?? null, body.sku || '')
+      const movable = row ? movableOf(row) : 0
+      if (!Number.isFinite(qty) || qty <= 0 || r6(qty) > movable + EPS) {
+        return sendJson(res, 400, { error: 'invalid_move', message: `Chuyển vượt phần di chuyển được tại nguồn (di chuyển được ${movable})` })
+      }
+      try {
+        const out = applyMovementTxn({
+          type: 'MOVE', sku: String(body.sku), lot_id: body.lot_id ?? null, qty,
+          warehouse_id: body.warehouse_id ?? null, from_location_id: fromId, location_id: toId,
+          doc_type: 'MANUAL', note: 'Chuyển vị trí trong kho',
+        }, s.username)
+        if (body.lot_id != null) {
+          const after = findBalanceRowS(body.warehouse_id ?? null, fromId, body.lot_id, body.sku || '')
+          if (!after || after.on_hand <= 0) {
+            db.prepare('UPDATE lots SET location_id = ? WHERE lot_id = ?').run(toId, body.lot_id)
+          }
+        }
+        return sendJson(res, 201, out)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+    }
+
+    if (p === '/api/transfer-orders' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      return sendJson(res, 200, { transfer_orders: db.prepare('SELECT * FROM transfer_orders ORDER BY id DESC').all() })
+    }
+    if (p === '/api/transfer-orders' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_transfer')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_transfer' })
+      const body = await readBody(req)
+      const fromWh = Number(body.from_warehouse_id)
+      const toWh = Number(body.to_warehouse_id)
+      if (!fromWh || !toWh || fromWh === toWh) {
+        return sendJson(res, 400, { error: 'invalid_transfer', message: 'Kho nguồn và kho đích phải khác nhau' })
+      }
+      const lines = Array.isArray(body.lines) ? body.lines : []
+      if (!lines.length) return sendJson(res, 400, { error: 'invalid_transfer', message: 'Phiếu chuyển cần ít nhất một dòng' })
+      for (const [i, l] of lines.entries()) {
+        if (!String(l.sku || '').trim()) return sendJson(res, 400, { error: 'invalid_transfer', message: `Dòng ${i + 1}: chưa nhập SKU` })
+        if (!Number.isFinite(Number(l.qty)) || Number(l.qty) <= 0) {
+          return sendJson(res, 400, { error: 'invalid_transfer', message: `Dòng ${i + 1}: số lượng chuyển phải lớn hơn 0` })
+        }
+        const from = db.prepare('SELECT * FROM locations WHERE id = ?').get(Number(l.from_location_id))
+        const to = db.prepare('SELECT * FROM locations WHERE id = ?').get(Number(l.to_location_id))
+        if (!from || from.warehouse_id !== fromWh) return sendJson(res, 400, { error: 'invalid_transfer', message: `Dòng ${i + 1}: vị trí nguồn không thuộc kho nguồn` })
+        if (!to || to.warehouse_id !== toWh) return sendJson(res, 400, { error: 'invalid_transfer', message: `Dòng ${i + 1}: vị trí đích không thuộc kho đích` })
+      }
+      const at = nowStamp()
+      let transferId; let transferNo
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        db.prepare('UPDATE transfer_counter SET n = n + 1 WHERE id = 1').run()
+        const info = db.prepare(`INSERT INTO transfer_orders (transfer_no, from_warehouse_id, to_warehouse_id, status, note, created_at, created_by)
+          VALUES ((SELECT 'CK-' || printf('%04d', n) FROM transfer_counter WHERE id = 1), ?, ?, 'DRAFT', ?, ?, ?)`)
+          .run(fromWh, toWh, body.note ?? null, at, s.username)
+        transferId = Number(info.lastInsertRowid)
+        transferNo = db.prepare('SELECT transfer_no FROM transfer_orders WHERE id = ?').get(transferId).transfer_no
+        const insLine = db.prepare('INSERT INTO transfer_lines (transfer_id, sku, lot_id, from_location_id, to_location_id, qty) VALUES (?, ?, ?, ?, ?, ?)')
+        for (const l of lines) {
+          insLine.run(transferId, String(l.sku).trim(), l.lot_id ?? null, Number(l.from_location_id), Number(l.to_location_id), Number(l.qty))
+        }
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        return sendJson(res, 400, { error: 'transfer_rejected', message: String(e.message || e) })
+      }
+      return sendJson(res, 201, { id: transferId, transfer_no: transferNo })
+    }
+    const trIdMatch = /^\/api\/transfer-orders\/(\d+)$/.exec(p)
+    if (trIdMatch && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const full = getTransferFull(Number(trIdMatch[1]))
+      if (!full) return sendJson(res, 404, { error: 'transfer_not_found', message: 'Không tìm thấy phiếu chuyển kho' })
+      return sendJson(res, 200, full)
+    }
+    const trShip = /^\/api\/transfer-orders\/(\d+)\/ship$/.exec(p)
+    if (trShip && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_transfer')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_transfer' })
+      const full = getTransferFull(Number(trShip[1]))
+      if (!full) return sendJson(res, 404, { error: 'transfer_not_found', message: 'Không tìm thấy phiếu chuyển kho' })
+      if (full.order.status !== 'DRAFT') {
+        return sendJson(res, 400, { error: 'invalid_transition', message: `Phiếu đang ở trạng thái ${full.order.status}, không xuất được` })
+      }
+      const movements = []
+      for (const l of full.lines) {
+        const row = findBalanceRowS(full.order.from_warehouse_id, l.from_location_id, l.lot_id, l.sku)
+        const movable = row ? movableOf(row) : 0
+        if (r6(l.qty) > movable + EPS) {
+          return sendJson(res, 400, { error: 'insufficient', message: `Dòng ${l.sku}: xuất chuyển ${l.qty} vượt phần di chuyển được tại nguồn (${movable})` })
+        }
+        movements.push({
+          type: 'TRANSFER_OUT', sku: l.sku, lot_id: l.lot_id, qty: l.qty,
+          warehouse_id: full.order.from_warehouse_id, location_id: l.from_location_id,
+          doc_type: 'TRANSFER', doc_id: full.order.id, doc_line_id: l.id, note: 'Xuất chuyển kho',
+        })
+      }
+      try {
+        for (const m of movements) applyMovementTxn(m, s.username)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      db.prepare("UPDATE transfer_orders SET status = 'IN_TRANSIT', shipped_at = ?, shipped_by = ? WHERE id = ?")
+        .run(nowStamp(), s.username, full.order.id)
+      return sendJson(res, 200, { id: full.order.id, status: 'IN_TRANSIT' })
+    }
+    const trReceive = /^\/api\/transfer-orders\/(\d+)\/receive$/.exec(p)
+    if (trReceive && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_transfer')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_transfer' })
+      const full = getTransferFull(Number(trReceive[1]))
+      if (!full) return sendJson(res, 404, { error: 'transfer_not_found', message: 'Không tìm thấy phiếu chuyển kho' })
+      if (full.order.status !== 'IN_TRANSIT') {
+        return sendJson(res, 400, { error: 'invalid_transition', message: `Phiếu đang ở trạng thái ${full.order.status}, chưa nhận được` })
+      }
+      try {
+        for (const l of full.lines) {
+          applyMovementTxn({
+            type: 'TRANSFER_IN', sku: l.sku, lot_id: l.lot_id, qty: l.qty,
+            warehouse_id: full.order.to_warehouse_id, location_id: l.to_location_id,
+            from_location_id: l.from_location_id, from_warehouse_id: full.order.from_warehouse_id,
+            doc_type: 'TRANSFER', doc_id: full.order.id, doc_line_id: l.id, note: 'Nhận chuyển kho',
+          }, s.username)
+          if (l.lot_id != null && l.to_location_id != null) {
+            db.prepare('UPDATE lots SET location_id = ? WHERE lot_id = ?').run(l.to_location_id, l.lot_id)
+          }
+        }
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      db.prepare("UPDATE transfer_orders SET status = 'DONE', received_at = ?, received_by = ? WHERE id = ?")
+        .run(nowStamp(), s.username, full.order.id)
+      return sendJson(res, 200, { id: full.order.id, status: 'DONE' })
+    }
+    const trCancel = /^\/api\/transfer-orders\/(\d+)\/cancel$/.exec(p)
+    if (trCancel && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_transfer')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_transfer' })
+      const full = getTransferFull(Number(trCancel[1]))
+      if (!full) return sendJson(res, 404, { error: 'transfer_not_found', message: 'Không tìm thấy phiếu chuyển kho' })
+      if (full.order.status !== 'DRAFT') {
+        return sendJson(res, 400, { error: 'invalid_transition', message: `Chỉ huỷ được phiếu nháp (đang là ${full.order.status})` })
+      }
+      db.prepare("UPDATE transfer_orders SET status = 'CANCELLED' WHERE id = ?").run(full.order.id)
+      return sendJson(res, 200, { id: full.order.id, status: 'CANCELLED' })
+    }
+
+    if (p === '/api/stock-policies' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      return sendJson(res, 200, { stock_policies: db.prepare('SELECT * FROM stock_policies ORDER BY sku').all() })
+    }
+    if (p === '/api/stock-policies' && req.method === 'PUT') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const body = await readBody(req)
+      const sku = String(body.sku || '').trim()
+      if (!sku) return sendJson(res, 400, { error: 'invalid_policy', message: 'Chưa nhập SKU cho chính sách tồn' })
+      const wh = body.warehouse_id ?? null
+      const existing = db.prepare('SELECT id FROM stock_policies WHERE warehouse_id IS ? AND UPPER(TRIM(sku)) = UPPER(TRIM(?))').get(wh, sku)
+      const vals = [body.min_qty ?? null, body.max_qty ?? null, body.reorder_point ?? null, body.reorder_qty ?? null, body.count_class ?? null]
+      if (existing) {
+        db.prepare('UPDATE stock_policies SET min_qty = ?, max_qty = ?, reorder_point = ?, reorder_qty = ?, count_class = ? WHERE id = ?')
+          .run(...vals, existing.id)
+        return sendJson(res, 200, { id: existing.id, sku })
+      }
+      const info = db.prepare('INSERT INTO stock_policies (warehouse_id, sku, min_qty, max_qty, reorder_point, reorder_qty, count_class) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(wh, sku, ...vals)
+      return sendJson(res, 201, { id: Number(info.lastInsertRowid), sku })
+    }
+    if (p === '/api/replenishment/suggestions' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      return sendJson(res, 200, computeReplenishmentS())
+    }
+    if (p === '/api/replenishment/create-pos' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'purchase_create')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền purchase_create' })
+      const { groups } = computeReplenishmentS()
+      const created = []
+      let skipped = 0
+      try {
+        for (const g of groups) {
+          if (g.supplier_id == null) { skipped += g.lines.length; continue }
+          const byWh = new Map()
+          for (const l of g.lines) {
+            const arr = byWh.get(l.warehouse_id) ?? []
+            arr.push(l)
+            byWh.set(l.warehouse_id, arr)
+          }
+          for (const [warehouseId, lines] of byWh) {
+            const po = createPoS({
+              supplier_id: g.supplier_id, warehouse_id: warehouseId,
+              note: 'PO nháp từ gợi ý đặt hàng lại (min/max) — GĐ3',
+              lines: lines.map((l) => {
+                const lot = db.prepare(`SELECT purchase_price FROM lots WHERE UPPER(TRIM(sku)) = UPPER(TRIM(?))
+                  AND purchase_price IS NOT NULL ORDER BY lot_id DESC LIMIT 1`).get(l.sku)
+                return { sku: l.sku, qty_ordered: l.suggested_qty, unit_price: lot ? lot.purchase_price : null }
+              }),
+            }, s.username)
+            created.push({ po_no: po.po_no, supplier_name: g.supplier_name, line_count: lines.length })
+          }
+        }
+      } catch (e) {
+        return sendJson(res, 400, { error: 'create_pos_rejected', message: String(e.message || e) })
+      }
+      return sendJson(res, 201, { created, skipped_unknown_supplier: skipped })
+    }
+
+    if (p === '/api/alerts/scan' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const drafts = scanAlertsS(nowStamp().slice(0, 10))
+      const at = nowStamp()
+      const upsert = db.prepare(`INSERT INTO alerts (alert_key, type, severity, sku, lot_id, location_id, message, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'NEW', ?, ?)
+        ON CONFLICT(alert_key) DO UPDATE SET severity = excluded.severity, message = excluded.message,
+          updated_at = excluded.updated_at, resolved_at = NULL,
+          status = CASE WHEN alerts.status = 'ACK' THEN 'ACK' ELSE 'NEW' END`)
+      for (const d of drafts) upsert.run(d.alert_key, d.type, d.severity, d.sku, d.lot_id, d.location_id, d.message, at, at)
+      const keys = new Set(drafts.map((d) => d.alert_key))
+      const open = db.prepare("SELECT id, alert_key FROM alerts WHERE status IN ('NEW', 'ACK')").all()
+      let resolved = 0
+      for (const r of open) {
+        if (!keys.has(r.alert_key)) {
+          db.prepare("UPDATE alerts SET status = 'RESOLVED', resolved_at = ?, updated_at = ? WHERE id = ?").run(at, at, r.id)
+          resolved++
+        }
+      }
+      return sendJson(res, 200, { found: drafts.length, resolved, alerts: drafts })
+    }
+    if (p === '/api/alerts' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const status = url.searchParams.get('status')
+      const rows = status
+        ? db.prepare('SELECT * FROM alerts WHERE status = ? ORDER BY id DESC').all(status)
+        : db.prepare('SELECT * FROM alerts ORDER BY id DESC').all()
+      return sendJson(res, 200, { alerts: rows })
+    }
+    const alertAck = /^\/api\/alerts\/(\d+)\/ack$/.exec(p)
+    if (alertAck && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_adjust')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_adjust' })
+      const alert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(Number(alertAck[1]))
+      if (!alert) return sendJson(res, 404, { error: 'alert_not_found', message: 'Không tìm thấy cảnh báo' })
+      if (alert.status === 'RESOLVED') return sendJson(res, 400, { error: 'already_resolved', message: 'Cảnh báo đã tự hết điều kiện' })
+      db.prepare("UPDATE alerts SET status = 'ACK', ack_by = ?, ack_at = ?, updated_at = ? WHERE id = ?")
+        .run(s.username, nowStamp(), nowStamp(), alert.id)
+      return sendJson(res, 200, { id: alert.id, status: 'ACK' })
     }
 
     if (p.startsWith('/api/') || p.startsWith('/federation/')) {

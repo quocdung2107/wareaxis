@@ -268,6 +268,182 @@ try {
   assert.equal(retsAfter.json.returns[0].status, 'DONE')
   console.log('✓ GĐ2 QC + putaway hàng trả: khả dụng A01-01 = 4, phiếu trả DONE')
 
+  // --- GĐ3: freeze -> allocation bị chặn một phần -> move -> kiểm kê quay vòng
+  // (expected/on_hand = 3 tại A01-01 sau freeze+move) -> đếm thiếu 1 -> duyệt áp
+  // -> transfer liên kho -> policy min/max -> PO nháp -> alerts hết hạn/tồn thấp ---
+  // Số tồn bắt đầu đoạn GĐ3 (cuối GĐ2): GD1-1 tại A01-01 on_hand=4, available=4; A01-02 trống.
+  const whId = atPick2.warehouse_id
+  const lotId = rl.lot_id
+  const balSku = async () => (await call('GET', '/api/inventory/balances?sku=GD1-1', { token, device })).json.balances
+  const atLoc = async (locId) => (await balSku()).find((b) => b.location_id === locId)
+
+  const freeze = await call('POST', '/api/inventory/freeze', {
+    token, device, body: { sku: 'GD1-1', lot_id: lotId, location_id: pickLoc.id, warehouse_id: whId, qty: 1, reason_code: 'QUALITY_HOLD' },
+  })
+  assert.equal(freeze.status, 201, JSON.stringify(freeze.json))
+  let bA = await atLoc(pickLoc.id)
+  assert.deepEqual([bA.on_hand, bA.hold, bA.available], [4, 1, 3])
+  const frozenList = await call('GET', '/api/inventory/frozen', { token, device })
+  assert.equal(frozenList.json.frozen.length, 1)
+  assert.equal(frozenList.json.frozen[0].reason_code, 'QUALITY_HOLD')
+  console.log('✓ GĐ3 đóng băng 1: on_hand=4, hold=1, khả dụng còn 3')
+
+  // Hàng đóng băng bị loại khỏi allocation: đơn 4 chỉ phân bổ được 3, backorder 1.
+  const ob2 = await call('POST', '/api/outbound-orders', {
+    token, device, body: { customer_name: 'Khách khói 2', lines: [{ sku: 'GD1-1', qty_ordered: 4 }] },
+  })
+  assert.equal(ob2.status, 201, JSON.stringify(ob2.json))
+  const alloc2 = await call('POST', `/api/outbound-orders/${ob2.json.id}/allocate`, { token, device, body: {} })
+  assert.equal(alloc2.json.results[0].qty_allocated, 3)
+  assert.equal(alloc2.json.results[0].backorder, 1)
+  const cancel2 = await call('POST', `/api/outbound-orders/${ob2.json.id}/cancel`, { token, device, body: {} })
+  assert.equal(cancel2.status, 200)
+  bA = await atLoc(pickLoc.id)
+  assert.deepEqual([bA.allocated, bA.available], [0, 3])
+  console.log('✓ GĐ3 allocation: đơn 4 chỉ giữ được 3 (1 đang băng), huỷ đơn nhả hết giữ chỗ')
+
+  const locs2 = await call('GET', '/api/locations', { token, device })
+  const pickLoc2 = locs2.json.locations.find((l) => l.code === 'A01-02')
+  assert.ok(pickLoc2)
+  const move = await call('POST', '/api/inventory/move', {
+    token, device,
+    body: { sku: 'GD1-1', lot_id: lotId, warehouse_id: whId, from_location_id: pickLoc.id, to_location_id: pickLoc2.id, qty: 1 },
+  })
+  assert.equal(move.status, 201, JSON.stringify(move.json))
+  bA = await atLoc(pickLoc.id)
+  const bB = await atLoc(pickLoc2.id)
+  // A01-01: on_hand 4-1(move) = 3 (gồm 1 đang băng), khả dụng 3-1(băng) = 2. A01-02: on_hand 1.
+  assert.deepEqual([bA.on_hand, bA.hold, bA.available], [3, 1, 2])
+  assert.deepEqual([bB.on_hand, bB.available], [1, 1])
+  console.log('✓ GĐ3 move 1 sang A01-02: A01-01 on_hand=3 (băng 1), A01-02 on_hand=1')
+
+  // Kiểm kê tại A01-01: expected = on_hand vật lý = 3 (kể cả phần đang băng);
+  // hold_qty snapshot riêng = 1, không tính chênh lệch. Đếm thực tế 2 -> thiếu 1.
+  const cc = await call('POST', '/api/cycle-counts', {
+    token, device, body: { scope_type: 'LOCATION', location_id: pickLoc.id },
+  })
+  assert.equal(cc.status, 201, JSON.stringify(cc.json))
+  assert.match(cc.json.count_no, /^CC-\d{4}$/)
+  assert.equal(cc.json.task_count, 1)
+  const ccFull = await call('GET', `/api/cycle-counts/${cc.json.id}`, { token, device })
+  const ccTask = ccFull.json.tasks[0]
+  assert.deepEqual([ccTask.expected_qty, ccTask.hold_qty, ccTask.inspect_qty], [3, 1, 0])
+  const ccCount = await call('POST', `/api/cycle-counts/${cc.json.id}/count`, {
+    token, device, body: { entries: [{ task_id: ccTask.id, counted_qty: 2 }] },
+  })
+  assert.equal(ccCount.json.status, 'COUNTED')
+  const ccApprove = await call('POST', `/api/cycle-counts/${cc.json.id}/approve`, { token, device, body: {} })
+  assert.equal(ccApprove.status, 200, JSON.stringify(ccApprove.json))
+  assert.equal(ccApprove.json.status, 'APPLIED')
+  assert.equal(ccApprove.json.movements, 1) // 1 movement ADJUST_OUT với reason COUNT_VARIANCE
+  bA = await atLoc(pickLoc.id)
+  // Sau áp chênh lệch: on_hand 3-1 = 2, hold vẫn 1, khả dụng 2-1 = 1.
+  assert.deepEqual([bA.on_hand, bA.hold, bA.available], [2, 1, 1])
+  console.log('✓ GĐ3 kiểm kê: expected=3, đếm 2 -> ADJUST_OUT 1 -> on_hand=2, khả dụng=1')
+
+  const unfreeze = await call('POST', '/api/inventory/unfreeze', {
+    token, device, body: { sku: 'GD1-1', lot_id: lotId, location_id: pickLoc.id, warehouse_id: whId, qty: 1 },
+  })
+  assert.equal(unfreeze.status, 201, JSON.stringify(unfreeze.json))
+  bA = await atLoc(pickLoc.id)
+  assert.deepEqual([bA.on_hand, bA.hold, bA.available], [2, 0, 2])
+  console.log('✓ GĐ3 mở băng: khả dụng A01-01 về 2')
+
+  // Chuyển kho: tạo kho đích WH2 + vị trí B01-01, chuyển 1 từ A01-02 sang.
+  const wh2 = await call('POST', '/api/warehouses', { token, device, body: { code: 'WH2', name: 'Kho 2 khói' } })
+  assert.equal(wh2.status, 201, JSON.stringify(wh2.json))
+  const locB = await call('POST', '/api/locations', {
+    token, device, body: { warehouse_id: wh2.json.id, code: 'B01-01', loc_type: 'PICKABLE', pick_sequence: 101 },
+  })
+  assert.equal(locB.status, 201, JSON.stringify(locB.json))
+  const tr = await call('POST', '/api/transfer-orders', {
+    token, device,
+    body: {
+      from_warehouse_id: whId, to_warehouse_id: wh2.json.id,
+      lines: [{ sku: 'GD1-1', lot_id: lotId, from_location_id: pickLoc2.id, to_location_id: locB.json.id, qty: 1 }],
+    },
+  })
+  assert.equal(tr.status, 201, JSON.stringify(tr.json))
+  assert.match(tr.json.transfer_no, /^CK-\d{4}$/)
+  const trShip = await call('POST', `/api/transfer-orders/${tr.json.id}/ship`, { token, device, body: {} })
+  assert.equal(trShip.json.status, 'IN_TRANSIT')
+  let bFrom = await atLoc(pickLoc2.id)
+  assert.deepEqual([bFrom.on_hand, bFrom.in_transit], [0, 1])
+  const trRecv = await call('POST', `/api/transfer-orders/${tr.json.id}/receive`, { token, device, body: {} })
+  assert.equal(trRecv.json.status, 'DONE')
+  bFrom = await atLoc(pickLoc2.id)
+  const bDest = (await balSku()).find((b) => b.location_id === locB.json.id)
+  assert.deepEqual([bFrom.on_hand, bFrom.in_transit], [0, 0])
+  assert.deepEqual([bDest.on_hand, bDest.available], [1, 1])
+  console.log('✓ GĐ3 chuyển kho: xuất -> in_transit=1 -> nhận kho đích on_hand=1, phiếu DONE')
+
+  // Policy min 5 / max 10 cho kho chính: khả dụng (kho chính) = 2 < min 5.
+  // Đang đặt (on_order) của PO-0001 PARTIAL = 10 - 8 = 2 -> gợi ý = 10 - 2 - 2 = 6.
+  const pol = await call('PUT', '/api/stock-policies', {
+    token, device, body: { sku: 'GD1-1', warehouse_id: whId, min_qty: 5, max_qty: 10 },
+  })
+  assert.equal(pol.status, 201, JSON.stringify(pol.json))
+  const sugg = await call('GET', '/api/replenishment/suggestions', { token, device })
+  const suggGd1 = sugg.json.suggestions.find((x) => x.sku === 'GD1-1')
+  assert.ok(suggGd1, 'phải có gợi ý cho GD1-1')
+  assert.deepEqual([suggGd1.available, suggGd1.on_order, suggGd1.suggested_qty], [2, 2, 6])
+  console.log('✓ GĐ3 gợi ý đặt hàng: available=2, on_order=2 -> suggested=6 (max 10)')
+
+  const sup = await call('POST', '/api/suppliers', { token, device, body: { code: 'SUP-SMOKE', name: 'NCC Khói' } })
+  assert.equal(sup.status, 201, JSON.stringify(sup.json))
+  const setSup = await call('PUT', '/api/products/default-supplier', {
+    token, device, body: { sku: 'GD1-1', supplier_id: sup.json.id },
+  })
+  assert.equal(setSup.status, 200, JSON.stringify(setSup.json))
+  const createdPos = await call('POST', '/api/replenishment/create-pos', { token, device, body: {} })
+  assert.equal(createdPos.status, 201, JSON.stringify(createdPos.json))
+  assert.equal(createdPos.json.created.length, 1)
+  const draftPo = await call('GET', `/api/purchase-orders?status=DRAFT`, { token, device })
+  const draft = draftPo.json.purchase_orders.find((x) => x.po_no === createdPos.json.created[0].po_no)
+  assert.ok(draft && draft.status === 'DRAFT')
+  const draftFull = await call('GET', `/api/purchase-orders/${draft.id}`, { token, device })
+  assert.equal(draftFull.json.lines[0].qty_ordered, 6)
+  console.log('✓ GĐ3 tạo PO nháp từ gợi ý: DRAFT với dòng đặt 6')
+
+  // Lô sắp hết hạn (+5 ngày) qua luồng nhận GĐ1 để quét cảnh báo.
+  const expDate = new Date(Date.now() + 5 * 86400000)
+  const ep = (n) => String(n).padStart(2, '0')
+  const expStr = `${expDate.getFullYear()}-${ep(expDate.getMonth() + 1)}-${ep(expDate.getDate())}`
+  const po3 = await call('POST', '/api/purchase-orders', {
+    token, device, body: { lines: [{ sku: 'GD3-EXP', description: 'Hàng sắp hết hạn', qty_ordered: 3, unit_price: 500 }] },
+  })
+  assert.equal(po3.status, 201, JSON.stringify(po3.json))
+  await call('POST', `/api/purchase-orders/${po3.json.id}/transition`, { token, device, body: { to: 'SENT' } })
+  const po3Full0 = await call('GET', `/api/purchase-orders/${po3.json.id}`, { token, device })
+  const rcv3 = await call('POST', `/api/purchase-orders/${po3.json.id}/receive`, {
+    token, device,
+    body: { lines: [{ po_line_id: po3Full0.json.lines[0].id, qty_received: 3, expiry_date: expStr }] },
+  })
+  assert.equal(rcv3.status, 201, JSON.stringify(rcv3.json))
+  const po3Full = await call('GET', `/api/purchase-orders/${po3.json.id}`, { token, device })
+  const rl3 = po3Full.json.receipts[0].lines[0]
+  const qc3 = await call('POST', `/api/receipts/${rcv3.json.receipt_id}/qc`, {
+    token, device, body: { receipt_line_id: rl3.id, qty_pass: 3, qty_fail: 0 },
+  })
+  assert.equal(qc3.status, 200, JSON.stringify(qc3.json))
+  const put3 = await call('POST', `/api/receipts/${rcv3.json.receipt_id}/putaway`, {
+    token, device, body: { receipt_line_id: rl3.id, qty: 3, to_location_id: pickLoc.id },
+  })
+  assert.equal(put3.status, 200, JSON.stringify(put3.json))
+
+  const scan = await call('POST', '/api/alerts/scan', { token, device, body: {} })
+  assert.equal(scan.status, 200, JSON.stringify(scan.json))
+  const alertsRes = await call('GET', '/api/alerts', { token, device })
+  const expAlert = alertsRes.json.alerts.find((a) => a.type === 'EXPIRY_7' && a.sku === 'GD3-EXP')
+  assert.ok(expAlert, 'phải có cảnh báo EXPIRY_7 cho lô +5 ngày')
+  assert.equal(expAlert.severity, 'CRITICAL')
+  const lowAlert = alertsRes.json.alerts.find((a) => a.type === 'LOW_STOCK' && a.sku === 'GD1-1')
+  assert.ok(lowAlert, 'phải có cảnh báo LOW_STOCK cho GD1-1 (khả dụng 2 < min 5)')
+  assert.equal(lowAlert.severity, 'WARN')
+  const ack = await call('POST', `/api/alerts/${lowAlert.id}/ack`, { token, device, body: {} })
+  assert.equal(ack.json.status, 'ACK')
+  console.log('✓ GĐ3 cảnh báo: EXPIRY_7 CRITICAL (lô +5 ngày) + LOW_STOCK WARN, ACK được')
+
   const backup = await call('POST', '/api/admin/backup', { token })
   assert.equal(backup.status, 200)
   assert.ok(fs.existsSync(path.join(tmp, 'backups', backup.json.file)), 'file backup phải tồn tại')

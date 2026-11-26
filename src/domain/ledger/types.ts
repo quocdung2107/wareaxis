@@ -68,6 +68,12 @@ export interface StockMovement extends BalanceKey {
   qty: number // luôn > 0
   /** Vị trí nguồn cho MOVE / TRANSFER_OUT (balance đích lấy location_id). */
   from_location_id?: number | null
+  /**
+   * GĐ3: kho nguồn cho TRANSFER_IN hai phía (chuyển kho): xô in_transit nằm ở
+   * balance (from_warehouse_id, from_location_id); balance đích lấy warehouse_id.
+   * Thiếu cả hai trường from_* thì TRANSFER_IN áp một phía như cũ.
+   */
+  from_warehouse_id?: number | null
   doc_type?: DocType | null
   doc_id?: number | null
   doc_line_id?: number | null
