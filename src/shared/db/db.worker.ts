@@ -18,7 +18,7 @@ let reason: string | undefined
 async function init() {
   const sqlite3 = await sqlite3InitModule()
   try {
-    const pool = await sqlite3.installOpfsSAHPoolVfs({ directory: '/warehouse-assistant' })
+    const pool = await sqlite3.installOpfsSAHPoolVfs({ directory: '/wareaxis' })
     db = new pool.OpfsSAHPoolDb('/kho.sqlite3')
     return true
   } catch (e) {
