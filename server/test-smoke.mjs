@@ -4,7 +4,9 @@
 // health -> login -> đăng ký thiết bị (PENDING, bị chặn) -> duyệt -> movement -> balances
 // -> chặn âm/thiếu lý do -> federation ping/availability -> backup. Tự dọn DB tạm.
 import { spawn } from 'node:child_process'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import assert from 'node:assert/strict'
@@ -630,6 +632,127 @@ try {
     if (childB) childB.kill('SIGTERM')
     childB = null
     fs.rmSync(tmpB, { recursive: true, force: true })
+  }
+
+  // --- GĐ5: Báo cáo + Webhook — dùng dữ liệu server A tích lũy qua GĐ1–GĐ3.
+  // Trạng thái GD1-1 lúc này: NHAN-01 on_hand=1 (damaged=1), A01-01 on_hand=2,
+  // B01-01 (kho WH2) on_hand=1 -> tổng on_hand của lô = 4; giá nhập lô = 1000
+  // (server lấy từ unit_price của dòng PO khi nhận không nhập giá tay).
+  const card = await call('GET', `/api/reports/stock-card?lot_id=${lotId}`, { token })
+  assert.equal(card.status, 200, JSON.stringify(card.json))
+  assert.equal(card.json.card.lines.length, 15, 'lô GD1-1 phải có 15 dòng biến động qua GĐ1–GĐ3')
+  assert.equal(card.json.card.closing.on_hand, 4)
+  assert.equal(card.json.balances_on_hand, 4)
+  assert.equal(card.json.card.closing.on_hand, card.json.balances_on_hand)
+  console.log('✓ GĐ5 thẻ kho: 15 dòng, số dư cuối thẻ = tổng balances của lô = 4')
+
+  const inout = await call('GET', '/api/reports/in-out?from=2000-01-01&to=2999-12-31', { token })
+  assert.equal(inout.status, 200, JSON.stringify(inout.json))
+  const ioGd1 = inout.json.rows.find((r) => r.sku === 'GD1-1')
+  // Nhập: RECEIVE 8 + RETURN_IN 2 + TRANSFER_IN 1 = 11.
+  // Xuất: PICK 5 + ADJUST_OUT 1 + TRANSFER_OUT 1 = 7. (ALLOCATE/FREEZE/MOVE/DAMAGE trung tính.)
+  assert.deepEqual([ioGd1.opening, ioGd1.in_qty, ioGd1.out_qty, ioGd1.closing], [0, 11, 7, 4])
+  assert.equal(inout.json.balances_on_hand['GD1-1'], 4)
+  assert.equal(ioGd1.closing, inout.json.balances_on_hand['GD1-1'])
+  console.log('✓ GĐ5 nhập–xuất–tồn: GD1-1 nhập 11, xuất 7, cuối kỳ 4 = balances')
+
+  const valuation = await call('GET', '/api/reports/valuation', { token })
+  assert.equal(valuation.status, 200, JSON.stringify(valuation.json))
+  const valGd1 = valuation.json.rows.find((r) => r.lot_id === lotId)
+  assert.deepEqual(
+    [valGd1.purchase_price, valGd1.qty_physical, valGd1.qty_damaged, valGd1.qty_valued, valGd1.value, valGd1.damaged_value],
+    [1000, 4, 1, 3, 3000, 1000],
+  )
+  // Lô GD3-EXP: giá 500 x tồn 3 = 1500. Tổng giá trị = 3000 + 1500 = 4500, không lô nào thiếu giá.
+  assert.equal(valuation.json.total_value, 4500)
+  assert.equal(valuation.json.unpriced.lot_count, 0)
+  console.log('✓ GĐ5 định giá: GD1-1 giá trị 3 x 1000 = 3000 (hỏng 1 tách riêng), tổng 4500')
+
+  const recon = await call('GET', '/api/reports/reconciliation', { token })
+  assert.equal(recon.status, 200, JSON.stringify(recon.json))
+  assert.equal(recon.json.file_source, 'not_managed_on_server')
+  const recGd1 = recon.json.rows.find((r) => r.sku === 'GD1-1')
+  assert.deepEqual([recGd1.ledger_qty, recGd1.file_qty, recGd1.status], [4, 0, 'ONLY_LEDGER'])
+  console.log('✓ GĐ5 đối chiếu: GD1-1 ONLY_LEDGER (server không quản lý file), ledger_qty=4')
+
+  const journal = await call('GET', '/api/reports/journal?sku=GD1-1&type=PICK', { token })
+  assert.equal(journal.status, 200)
+  assert.equal(journal.json.movements.length, 1)
+  assert.equal(journal.json.movements[0].qty, 5)
+  console.log('✓ GĐ5 nhật ký: lọc SKU + loại PICK ra đúng 1 dòng lấy 5')
+
+  // Webhook: listener tạm -> đăng ký -> bắn thử -> ship 1 đơn nhỏ -> listener
+  // phải nhận đúng 1 POST shipment.shipped (kèm chữ ký HMAC đúng) + log ok.
+  const hookHits = []
+  const listener = http.createServer((req, res) => {
+    let raw = ''
+    req.on('data', (c) => { raw += c })
+    req.on('end', () => {
+      hookHits.push({ raw, signature: req.headers['x-wareaxis-signature'], event: req.headers['x-wareaxis-event'] })
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end('{}')
+    })
+  })
+  await new Promise((r) => listener.listen(0, '127.0.0.1', r))
+  try {
+    const hookPort = listener.address().port
+    const hook = await call('POST', '/api/webhooks', {
+      token,
+      body: {
+        name: 'Khói GĐ5', url: `http://127.0.0.1:${hookPort}/hook`,
+        events: ['shipment.shipped'], secret: 'smoke-secret',
+      },
+    })
+    assert.equal(hook.status, 201, JSON.stringify(hook.json))
+    assert.equal(hook.json.has_secret, true)
+    assert.ok(!('secret' in hook.json), 'API không được trả lại secret')
+
+    const hookTest = await call('POST', `/api/webhooks/${hook.json.id}/test`, { token })
+    assert.equal(hookTest.status, 200, JSON.stringify(hookTest.json))
+    assert.equal(hookTest.json.ok, true)
+    assert.equal(hookHits.filter((h) => h.event === 'webhook.test').length, 1)
+    console.log('✓ GĐ5 webhook: đăng ký + bắn thử tới listener, log qua endpoint test')
+
+    const ob5 = await call('POST', '/api/outbound-orders', {
+      token, device, body: { customer_name: 'Khách khói GĐ5', lines: [{ sku: 'GD1-1', qty_ordered: 1 }] },
+    })
+    assert.equal(ob5.status, 201, JSON.stringify(ob5.json))
+    const alloc5 = await call('POST', `/api/outbound-orders/${ob5.json.id}/allocate`, { token, device, body: {} })
+    assert.equal(alloc5.json.results[0].qty_allocated, 1)
+    const wave5 = await call('POST', '/api/waves', { token, device, body: { order_ids: [ob5.json.id] } })
+    assert.equal(wave5.status, 201, JSON.stringify(wave5.json))
+    const tasks5 = await call('GET', `/api/waves/${wave5.json.wave_id}/tasks`, { token, device })
+    const pick5 = await call('POST', `/api/pick-tasks/${tasks5.json.tasks[0].id}/confirm`, { token, device, body: { qty: 1 } })
+    assert.equal(pick5.status, 200, JSON.stringify(pick5.json))
+    const pack5 = await call('POST', `/api/outbound-orders/${ob5.json.id}/pack`, {
+      token, device, body: { scans: [{ sku: 'GD1-1', qty: 1 }] },
+    })
+    assert.equal(pack5.status, 200, JSON.stringify(pack5.json))
+    const ship5 = await call('POST', `/api/outbound-orders/${ob5.json.id}/ship`, {
+      token, device, body: { carrier_text: 'Xe khói GĐ5' },
+    })
+    assert.equal(ship5.status, 201, JSON.stringify(ship5.json))
+
+    // Webhook bắn nền: chờ listener nhận (tối đa ~5s).
+    let shippedHit = null
+    for (let i = 0; i < 50 && !shippedHit; i++) {
+      shippedHit = hookHits.find((h) => h.event === 'shipment.shipped') ?? null
+      if (!shippedHit) await new Promise((r) => setTimeout(r, 100))
+    }
+    assert.ok(shippedHit, 'listener phải nhận được webhook shipment.shipped')
+    const expectedSig = 'sha256=' + crypto.createHmac('sha256', 'smoke-secret').update(shippedHit.raw).digest('hex')
+    assert.equal(shippedHit.signature, expectedSig)
+    const shippedPayload = JSON.parse(shippedHit.raw)
+    assert.equal(shippedPayload.event, 'shipment.shipped')
+    assert.equal(shippedPayload.data.shipment_no, ship5.json.shipment_no)
+    await new Promise((r) => setTimeout(r, 300))
+    assert.equal(hookHits.filter((h) => h.event === 'shipment.shipped').length, 1, 'chỉ bắn đúng 1 lần')
+    const hookLog = await call('GET', '/api/webhooks/log', { token })
+    assert.ok(hookLog.json.log.some((l) => l.event === 'shipment.shipped' && l.status === 'ok'))
+    assert.ok(hookLog.json.log.some((l) => l.event === 'webhook.test' && l.status === 'ok'))
+    console.log('✓ GĐ5 webhook: ship -> listener nhận đúng 1 POST shipment.shipped, chữ ký HMAC khớp, log ok')
+  } finally {
+    listener.close()
   }
 
   console.log('\nSMOKE TEST PASS')

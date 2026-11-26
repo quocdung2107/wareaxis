@@ -125,6 +125,79 @@ cơ sở dữ liệu tồn trung tâm, không kho nào sửa được tồn củ
   bằng phiếu chuyển kho của GĐ3 tại từng kho; portal chỉ gợi ý, không tự
   sửa tồn. Chi tiết vận hành: `server/README.md`.
 
+## GĐ5 — Báo cáo & tích hợp (giai đoạn cuối của kế hoạch v2)
+
+Mục **Báo cáo** trong app (nhóm Kiểm đếm, cần quyền `reports_view`) gồm 5 tab
++ 1 tab Webhook. Báo cáo **chỉ đọc** `stock_movements` / `stock_balances` —
+mọi con số đều truy được về sổ cái, không tính từ trạng thái giao diện:
+
+- **Thẻ kho điện tử** theo từng lô: toàn bộ dòng biến động của lô kèm thay
+  đổi từng xô và tồn lũy kế sau mỗi dòng; số dư cuối thẻ được đối chứng tự
+  động với tổng `stock_balances` của lô ngay trên màn hình. Xuất CSV.
+- **Nhập–Xuất–Tồn theo kỳ** theo SKU (lọc được theo kho): Nhập = RECEIVE /
+  RETURN_IN / ADJUST_IN / TRANSFER_IN; Xuất = PICK / ADJUST_OUT / WRITE_OFF /
+  TRANSFER_OUT — phân loại theo hiệu ứng on_hand thực tế trong sổ cái. Các
+  movement chỉ đổi xô/vị trí (ALLOCATE, FREEZE, DAMAGE, MOVE, PUTAWAY...)
+  không tính vào nhập/xuất. Xuất Excel.
+- **Định giá tồn theo lô**: tồn còn lại của mỗi lô × giá nhập của chính lô đó
+  (hàng xuất theo FEFO/FIFO nên lô cũ đi trước). Hàng hỏng tách cột và định
+  giá riêng, không gộp vào tổng giá trị bán được; lô chưa có giá nhập đi vào
+  nhóm "chưa có giá" — chỉ đếm số lượng, không âm thầm tính 0 vào tổng.
+- **Đối chiếu MISA/file**: so tồn sổ cái với tồn luồng file (Σ `qty_system`
+  kỳ hiện hành − số đã lấy kể từ lần nạp file — đúng công thức app hiển thị),
+  trạng thái Khớp / Lệch / Chỉ có ở sổ cái / Chỉ có ở file. Hai nguồn tồn
+  song song là có chủ đích; bảng này để đối soát, không phải báo lỗi.
+- **Nhật ký biến động**: lọc theo kỳ / loại movement / người thực hiện / SKU.
+- **Webhook** (chỉ chạy phía Warehouse Server): sự kiện `shipment.shipped`,
+  `po.received`, `alert.critical` — POST JSON kèm chữ ký HMAC-SHA256 khi có
+  secret, timeout 3 giây + thử lại 1 lần, mọi lần bắn ghi log; lỗi webhook
+  không làm hỏng nghiệp vụ chính. Client standalone không bắn webhook.
+  API: `server/README.md`.
+
+Warehouse Server cũng phục vụ các báo cáo qua API (`/api/reports/*`, quyền
+`reports_view`) — riêng đối chiếu phía server chỉ có phía sổ cái vì server
+không quản lý luồng nạp file.
+
+## Tổng kết bản v2 (WareAxis) — GĐ0 → GĐ5
+
+**Bản đồ tính năng:**
+
+| Giai đoạn | Nội dung chính |
+|---|---|
+| GĐ0 | Sổ cái tồn kho (`stock_movements` append-only + `stock_balances` dựng lại được), ma trận quyền 5 vai trò local, master data tối thiểu, đưa schema Supabase vào repo dạng ghi chép |
+| GĐ-LAN | Warehouse Server localhost tại kho (Node thuần, SQLite), đăng nhập + duyệt thiết bị, điện thoại làm việc qua LAN, sao lưu local, API liên kho bản đầu |
+| GĐ1 | Inbound: PO → nhận hàng (thiếu/thừa/hỏng trên dòng) → QC → gợi ý cất hàng; sổ cái là nguồn tồn chính cho hàng theo lô |
+| GĐ2 | Outbound: phân bổ FEFO/FIFO + backorder → wave lấy hàng theo lộ trình → đóng gói quét kiểm chứng → phiếu giao truy vết lô → trả hàng về đúng lô gốc |
+| GĐ3 | Vận hành: kiểm kê quay vòng (duyệt mới áp chênh lệch) → đóng băng/mở băng → chuyển vị trí + phiếu chuyển kho 2 bước → gợi ý đặt hàng min/max gom theo NCC thành PO nháp → trung tâm cảnh báo hạn dùng/tồn thấp |
+| GĐ4 | Federation Portal: khoá liên kho theo phía được cấp (lưu băm), chính sách chia sẻ 3 công tắc, cổng tra tồn nhiều kho chỉ-đọc qua VPN, kho offline hiện số liệu cũ kèm thời điểm |
+| GĐ5 | Báo cáo (thẻ kho, nhập–xuất–tồn, định giá theo lô, đối chiếu MISA, nhật ký) + webhook trạng thái |
+
+**Kiến trúc cuối (giữ nguyên quyết định v1.1):** một app React + SQLite
+local (standalone trên trình duyệt, hoặc qua Warehouse Server tại kho);
+Supabase chỉ cho tính năng chia sẻ (danh bạ xe, chat/theo dõi đơn) — **không
+chứa tồn kho**; tồn kho không rời kho, liên kho chỉ truy vấn chỉ-đọc qua VPN
+riêng; mọi thay đổi tồn đều qua một cổng duy nhất `applyMovement()` và ghi
+sổ cái kèm người thực hiện + lý do bắt buộc cho điều chỉnh/hỏng/xuất hủy.
+
+**Checklist bàn giao / vận hành ngắn:**
+
+1. Máy trung tâm tại kho: đặt `WMS_ADMIN_PASS` riêng, chạy
+   `npm run server`, sao lưu thư mục `server/data/` định kỳ (đây là tuyến
+   bảo vệ dữ liệu duy nhất — xem `server/README.md`).
+2. Tạo tài khoản cho từng vai trò (quản trị kho / thủ kho / NV lấy hàng /
+   NV nhận hàng / kế toán chỉ xem) và duyệt thiết bị trước khi cho làm việc.
+3. Việc cần làm tay trên GitHub: thêm `.github/workflows/deploy.yml` qua
+   giao diện web nếu muốn bật GitHub Pages cho bản sao này (API tích hợp
+   không có quyền ghi file workflow).
+4. Kiểm thử trước khi dùng thật: `npm test` (chỉ còn 5 test đọc file mẫu
+   Excel ngoài repo là fail do thiếu file mẫu) và
+   `node server/test-smoke.mjs` phải PASS.
+5. Giới hạn còn lại (chưa làm, theo đúng phạm vi kế hoạch): giao diện đăng
+   nhập/quản trị thiết bị ngay trong app LAN (hiện quản trị qua API), chữ ký
+   HMAC theo timestamp cho federation (hiện dùng khoá bearer qua VPN + băm
+   phía server), POS tại quầy và đơn vị chứa pallet (chỉ làm khi vận hành
+   thật cần).
+
 ## Triển khai lên GitHub Pages
 
 Địa chỉ app: `https://quocdung2107.github.io/wms/`

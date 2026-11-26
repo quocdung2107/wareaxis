@@ -31,6 +31,7 @@ const TOOLS: { group: string; path: string; title: string; hint: string; icon: I
   { group: 'Dữ liệu', path: 'khach-hang', title: 'Khách hàng', hint: 'Danh sách khách: mã, địa chỉ giao, Sup, SĐT', icon: 'users', page: lazy(() => import('../features/customers/CustomersPage.tsx')) },
   { group: 'Dữ liệu', path: 'dvt', title: 'Đơn vị tính', hint: 'Gom CAI / CÁI / Cái về một tên', icon: 'scale', page: lazy(() => import('../features/settings/UomPage.tsx')) },
   { group: 'Hệ thống', path: 'federation', title: 'Liên kho', hint: 'Khoá liên kho + chính sách chia sẻ + cổng tra tồn của nhiều kho (chỉ đọc, qua VPN)', icon: 'users', page: lazy(() => import('../features/federation/FederationPage.tsx')) },
+  { group: 'Kiểm đếm', path: 'reports', title: 'Báo cáo', hint: 'Thẻ kho theo lô, nhập–xuất–tồn, định giá tồn, đối chiếu MISA, nhật ký biến động (cần quyền reports_view)', icon: 'chart', page: lazy(() => import('../features/reports/ReportsPage.tsx')) },
 ]
 
 const GROUPS = ['Dữ liệu', 'Kiểm đếm', 'Lấy hàng', 'In ấn & file', 'Hệ thống']

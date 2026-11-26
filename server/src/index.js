@@ -161,6 +161,13 @@ CREATE INDEX IF NOT EXISTS idx_portal_cache_peer ON portal_cache(peer_id, kind);
   if (!prodCols.includes('default_supplier_id')) db.exec('ALTER TABLE products ADD COLUMN default_supplier_id INTEGER')
 }
 
+// Schema GĐ5: webhook cấu hình + nhật ký bắn (báo cáo chỉ đọc, không cần bảng mới).
+db.exec(`
+CREATE TABLE IF NOT EXISTS webhook_configs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT NOT NULL, events_json TEXT NOT NULL DEFAULT '[]', secret TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT, updated_at TEXT, created_by TEXT);
+CREATE TABLE IF NOT EXISTS webhook_log (id INTEGER PRIMARY KEY AUTOINCREMENT, config_id INTEGER, event TEXT NOT NULL, payload_json TEXT, status TEXT NOT NULL, http_status INTEGER, error TEXT, attempts INTEGER NOT NULL DEFAULT 1, at TEXT);
+CREATE INDEX IF NOT EXISTS idx_webhook_log_at ON webhook_log(at);
+`)
+
 const REASONS = [
   ['COUNT_VARIANCE', 'Chênh lệch kiểm kê', 1], ['DAMAGED', 'Hàng hỏng / vỡ', 0],
   ['EXPIRED', 'Hết hạn dùng', 0], ['LOST', 'Thất lạc / mất hàng', 1],
@@ -228,11 +235,12 @@ const nowStamp = () => {
 // ---------- Phân quyền (port từ src/domain/permissions/roles.ts + guard.ts) ----------
 // 'purchase_receive' bổ sung ở GĐ1 — nguồn: src/domain/permissions/roles.ts.
 // 'outbound_*' + 'returns_receive' bổ sung ở GĐ2 — nguồn: src/domain/permissions/roles.ts.
+// 'webhooks_manage' bổ sung ở GĐ5 — chỉ KHO_ADMIN có (nằm trong PERMISSIONS = ALL của admin).
 const PERMISSIONS = ['inventory_view', 'inventory_receive', 'inventory_putaway', 'inventory_pick', 'inventory_count',
   'inventory_adjust', 'inventory_transfer', 'purchase_create', 'purchase_receive',
   'outbound_allocate', 'outbound_pick', 'outbound_pack', 'outbound_ship', 'returns_receive',
   'reports_view', 'users_manage', 'devices_manage',
-  'backup_manage', 'federation_manage']
+  'backup_manage', 'federation_manage', 'webhooks_manage']
 const ROLE_PERMISSIONS = {
   KHO_ADMIN: PERMISSIONS,
   THU_KHO: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'inventory_pick', 'inventory_count', 'inventory_adjust', 'inventory_transfer', 'purchase_create', 'purchase_receive', 'outbound_allocate', 'outbound_pick', 'outbound_pack', 'outbound_ship', 'returns_receive', 'reports_view'],
@@ -730,6 +738,232 @@ function scanAlertsS(today) {
   const rank = { CRITICAL: 0, WARN: 1, INFO: 2 }
   return out.sort((a, b) => rank[a.severity] - rank[b.severity] || a.alert_key.localeCompare(b.alert_key))
 }
+
+// ---------- Báo cáo GĐ5 (port từ src/domain/reports/*) ----------
+// Chỉ ĐỌC stock_movements/stock_balances/lots. Hiệu ứng xô ở cấp lô khớp
+// src/domain/ledger/apply.ts (deltaFor + nhánh PICK/WRITE_OFF) — xem effects.ts.
+const emptyBucketsS = () => ({ on_hand: 0, allocated: 0, hold: 0, damaged: 0, inspect: 0, in_transit: 0 })
+const availableOfBucketsS = (b) => r6(b.on_hand - b.allocated - b.hold - b.damaged - b.inspect)
+function reversalDeltaS(o) {
+  const q = o.qty; const out = emptyBucketsS()
+  switch (o.type) {
+    case 'RECEIVE': case 'RETURN_IN':
+      out.on_hand = -q; if (o.into_inspect) out.inspect = -q; return out
+    case 'ADJUST_IN': out.on_hand = -q; return out
+    case 'ADJUST_OUT': out.on_hand = q; return out
+    case 'PUTAWAY': out.inspect = q; return out
+    case 'ALLOCATE': out.allocated = -q; return out
+    case 'DEALLOCATE': out.allocated = q; return out
+    case 'FREEZE': out.hold = -q; return out
+    case 'UNFREEZE': out.hold = q; return out
+    case 'DAMAGE': out.damaged = -q; if (o.from_inspect) out.inspect = q; return out
+    case 'TRANSFER_OUT': out.in_transit = -q; out.on_hand = q; return out
+    case 'TRANSFER_IN': out.in_transit = q; out.on_hand = -q; return out
+    case 'PICK': case 'WRITE_OFF': out.on_hand = q; return out
+    default: return out
+  }
+}
+function lotBucketDeltaS(m, running, byId) {
+  const q = m.qty; const out = emptyBucketsS()
+  switch (m.type) {
+    case 'RECEIVE': case 'RETURN_IN':
+      out.on_hand = q; if (m.into_inspect) out.inspect = q; return out
+    case 'ADJUST_IN': out.on_hand = q; return out
+    case 'PUTAWAY': out.inspect = -q; return out
+    case 'ALLOCATE': out.allocated = q; return out
+    case 'DEALLOCATE': out.allocated = -q; return out
+    case 'ADJUST_OUT': out.on_hand = -q; return out
+    case 'FREEZE': out.hold = q; return out
+    case 'UNFREEZE': out.hold = -q; return out
+    case 'DAMAGE':
+      if (m.from_inspect) out.inspect = -q
+      out.damaged = q; return out
+    case 'TRANSFER_OUT': out.on_hand = -q; out.in_transit = q; return out
+    case 'TRANSFER_IN': out.in_transit = -q; out.on_hand = q; return out
+    case 'MOVE': return out
+    case 'PICK': out.on_hand = -q; out.allocated = -Math.min(running.allocated, q); return out
+    case 'WRITE_OFF': out.on_hand = -q; out.damaged = -Math.min(running.damaged, q); return out
+    case 'REVERSAL': {
+      const orig = m.reverses_movement_id != null ? byId.get(m.reverses_movement_id) : undefined
+      return orig ? reversalDeltaS(orig) : out
+    }
+    default: return out
+  }
+}
+function onHandDeltaS(m, byId) {
+  switch (m.type) {
+    case 'RECEIVE': case 'RETURN_IN': case 'ADJUST_IN': case 'TRANSFER_IN': return m.qty
+    case 'PICK': case 'ADJUST_OUT': case 'WRITE_OFF': case 'TRANSFER_OUT': return -m.qty
+    case 'REVERSAL': {
+      const orig = m.reverses_movement_id != null ? byId.get(m.reverses_movement_id) : undefined
+      return orig ? -onHandDeltaS(orig, byId) : 0
+    }
+    default: return 0
+  }
+}
+function buildStockCardS(movements) {
+  const byId = new Map(movements.filter((m) => m.id != null).map((m) => [m.id, m]))
+  const running = emptyBucketsS()
+  const lines = movements.map((m) => {
+    const delta = lotBucketDeltaS(m, running, byId)
+    for (const k of Object.keys(running)) running[k] = r6(running[k] + delta[k])
+    return {
+      movement_id: m.id ?? null, at: m.created_at ?? null, type: m.type,
+      doc_type: m.doc_type ?? null, doc_id: m.doc_id ?? null,
+      location_id: m.location_id ?? null, from_location_id: m.from_location_id ?? null,
+      qty: m.qty, reason_code: m.reason_code ?? null, actor: m.actor ?? null, note: m.note ?? null,
+      delta, balance_after: { ...running }, available_after: availableOfBucketsS(running),
+    }
+  })
+  return { lines, closing: { ...running }, closing_available: availableOfBucketsS(running) }
+}
+function buildInOutS(movements, { from, to, warehouse_id }) {
+  const byId = new Map(movements.filter((m) => m.id != null).map((m) => [m.id, m]))
+  const acc = new Map()
+  for (const m of movements) {
+    if (warehouse_id != null && m.warehouse_id !== warehouse_id) continue
+    const day = String(m.created_at ?? '').slice(0, 10)
+    if (!day || day > to) continue
+    const d = onHandDeltaS(m, byId)
+    if (d === 0) continue
+    const k = String(m.sku).trim().toUpperCase()
+    let v = acc.get(k)
+    if (!v) { v = { sku: m.sku, opening: 0, in_qty: 0, out_qty: 0 }; acc.set(k, v) }
+    if (day < from) v.opening = r6(v.opening + d)
+    else if (d > 0) v.in_qty = r6(v.in_qty + d)
+    else v.out_qty = r6(v.out_qty - d)
+  }
+  return [...acc.values()]
+    .map((v) => ({ ...v, closing: r6(v.opening + v.in_qty - v.out_qty) }))
+    .sort((a, b) => String(a.sku).toUpperCase().localeCompare(String(b.sku).toUpperCase()))
+}
+// Định giá: qty_valued = on_hand − damaged (các xô hold/inspect/allocated nằm
+// TRONG on_hand, không cộng trùng); damaged định giá riêng; lô không giá ->
+// nhóm unpriced, không tính vào tổng.
+function buildValuationS(lotInputs) {
+  const money = (n) => Math.round(n * 100) / 100
+  const rows = []
+  for (const l of lotInputs) {
+    const onHand = r6(l.on_hand); const damaged = r6(l.damaged)
+    if (onHand <= 0 && damaged <= 0) continue
+    const qtyValued = r6(Math.max(0, onHand - damaged))
+    const priced = l.purchase_price != null && Number.isFinite(Number(l.purchase_price))
+    rows.push({
+      lot_id: l.lot_id, sku: l.sku, purchase_price: priced ? Number(l.purchase_price) : null,
+      qty_physical: onHand, qty_damaged: damaged, qty_valued: qtyValued,
+      value: priced ? money(qtyValued * Number(l.purchase_price)) : null,
+      damaged_value: priced ? money(damaged * Number(l.purchase_price)) : null,
+      priced, expiry_date: l.expiry_date ?? null, batch_no: l.batch_no ?? null,
+    })
+  }
+  rows.sort((a, b) => String(a.sku).localeCompare(String(b.sku)) || a.lot_id - b.lot_id)
+  const bySku = new Map(); const unpriced = { lot_count: 0, qty_valued: 0, qty_damaged: 0 }
+  let totalValue = 0; let totalDamagedValue = 0; let totalQtyValued = 0; let totalQtyDamaged = 0
+  for (const r of rows) {
+    totalQtyValued = r6(totalQtyValued + r.qty_valued)
+    totalQtyDamaged = r6(totalQtyDamaged + r.qty_damaged)
+    if (!r.priced) {
+      unpriced.lot_count += 1
+      unpriced.qty_valued = r6(unpriced.qty_valued + r.qty_valued)
+      unpriced.qty_damaged = r6(unpriced.qty_damaged + r.qty_damaged)
+      continue
+    }
+    totalValue = money(totalValue + (r.value ?? 0))
+    totalDamagedValue = money(totalDamagedValue + (r.damaged_value ?? 0))
+    const k = String(r.sku).trim().toUpperCase()
+    const s = bySku.get(k) ?? { sku: r.sku, qty_valued: 0, qty_damaged: 0, value: 0, lot_count: 0 }
+    s.qty_valued = r6(s.qty_valued + r.qty_valued)
+    s.qty_damaged = r6(s.qty_damaged + r.qty_damaged)
+    s.value = money(s.value + (r.value ?? 0))
+    s.lot_count += 1
+    bySku.set(k, s)
+  }
+  return {
+    rows, by_sku: [...bySku.values()].sort((a, b) => String(a.sku).localeCompare(String(b.sku))),
+    total_value: totalValue, total_damaged_value: totalDamagedValue,
+    total_qty_valued: totalQtyValued, total_qty_damaged: totalQtyDamaged, unpriced,
+  }
+}
+function buildReconciliationS(ledgerBySku, fileBySku) {
+  const norm = (src) => {
+    const out = new Map()
+    for (const [sku, qty] of Object.entries(src)) {
+      const k = String(sku).trim().toUpperCase()
+      const cur = out.get(k)
+      out.set(k, { sku: cur?.sku ?? sku, qty: r6((cur?.qty ?? 0) + Number(qty || 0)) })
+    }
+    return out
+  }
+  const ledger = norm(ledgerBySku); const file = norm(fileBySku)
+  const rows = []
+  for (const k of new Set([...ledger.keys(), ...file.keys()])) {
+    const l = ledger.get(k); const f = file.get(k)
+    const ledgerQty = l?.qty ?? 0; const fileQty = f?.qty ?? 0
+    const diff = r6(ledgerQty - fileQty)
+    const status = !l ? 'ONLY_FILE' : !f ? 'ONLY_LEDGER' : Math.abs(diff) <= 1e-9 ? 'MATCH' : 'DIFF'
+    rows.push({ sku: (l ?? f).sku, ledger_qty: ledgerQty, file_qty: fileQty, diff, status })
+  }
+  return rows.sort((a, b) => String(a.sku).toUpperCase().localeCompare(String(b.sku).toUpperCase()))
+}
+
+// ---------- Webhook GĐ5 ----------
+// Bắn POST JSON {event, at, data}; có secret -> header X-WareAxis-Signature =
+// 'sha256=' + HMAC-SHA256(secret, body). Timeout 3s, thử lại 1 lần sau 1s.
+// Mọi lần bắn đều ghi webhook_log; lỗi webhook KHÔNG bao giờ ném ra ngoài
+// (không được làm hỏng nghiệp vụ chính).
+const WEBHOOK_EVENTS = ['shipment.shipped', 'po.received', 'alert.critical', 'webhook.test']
+function logWebhook(configId, event, payload, status, httpStatus, error, attempts) {
+  try {
+    db.prepare('INSERT INTO webhook_log (config_id, event, payload_json, status, http_status, error, attempts, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(configId, event, JSON.stringify(payload), status, httpStatus, error, attempts, nowStamp())
+  } catch { /* log lỗi thì bỏ qua, không chặn nghiệp vụ */ }
+}
+async function deliverWebhook(cfg, event, data) {
+  const payload = { event, at: nowStamp(), data }
+  const bodyText = JSON.stringify(payload)
+  const headers = { 'Content-Type': 'application/json', 'X-WareAxis-Event': event }
+  if (cfg.secret) {
+    headers['X-WareAxis-Signature'] = 'sha256=' + crypto.createHmac('sha256', String(cfg.secret)).update(bodyText).digest('hex')
+  }
+  let attempts = 0; let httpStatus = null; let error = null
+  while (attempts < 2) {
+    attempts++
+    try {
+      const ctl = new AbortController()
+      const timer = setTimeout(() => ctl.abort(), 3000)
+      const res = await fetch(cfg.url, { method: 'POST', headers, body: bodyText, signal: ctl.signal })
+      clearTimeout(timer)
+      httpStatus = res.status
+      if (res.ok) {
+        logWebhook(cfg.id, event, payload, 'ok', httpStatus, null, attempts)
+        return { ok: true, http_status: httpStatus, attempts }
+      }
+      error = `HTTP ${res.status}`
+    } catch (e) {
+      error = String(e.name === 'AbortError' ? 'timeout 3s' : (e.message || e))
+    }
+    if (attempts < 2) await new Promise((r) => setTimeout(r, 1000))
+  }
+  logWebhook(cfg.id, event, payload, 'error', httpStatus, error, attempts)
+  return { ok: false, http_status: httpStatus, error, attempts }
+}
+function fireWebhooks(event, data) {
+  try {
+    const cfgs = db.prepare('SELECT * FROM webhook_configs WHERE enabled = 1').all()
+      .filter((c) => {
+        try { return JSON.parse(c.events_json || '[]').includes(event) } catch { return false }
+      })
+    for (const cfg of cfgs) {
+      deliverWebhook(cfg, event, data).catch(() => {})
+    }
+  } catch { /* nuốt lỗi: webhook không được làm hỏng nghiệp vụ */ }
+}
+const webhookPublic = (c) => ({
+  id: c.id, name: c.name, url: c.url,
+  events: (() => { try { return JSON.parse(c.events_json || '[]') } catch { return [] } })(),
+  has_secret: !!c.secret, enabled: !!c.enabled,
+  created_at: c.created_at, updated_at: c.updated_at, created_by: c.created_by,
+})
 
 // ---------- Federation GĐ4 (port từ src/domain/federation/policy.ts) ----------
 // Áp chính sách chia sẻ: tắt available -> rỗng; bóc trường giá vốn trừ khi
@@ -1384,6 +1618,7 @@ const server = http.createServer(async (req, res) => {
       }
       const at = nowStamp()
       let receiptId; let receiptNo; const movements = []
+      let poReachedReceived = false
       db.exec('BEGIN IMMEDIATE')
       try {
         const { n: nReceipts } = db.prepare('SELECT COUNT(*) AS n FROM receipts WHERE po_id = ?').get(poId)
@@ -1405,7 +1640,9 @@ const server = http.createServer(async (req, res) => {
           const rl = insRl.run(receiptId, line.id, line.sku, qtyExpected, qtyReceived, r6(qtyReceived - qtyDamaged), qtyDamaged,
             Math.max(0, r6(qtyExpected - qtyReceived)), Math.max(0, r6(qtyReceived - qtyExpected)), lotId)
           insLot.run(lotId, line.sku, line.sku, i.batch_no ?? null, i.lot_no ?? null, i.manuf_date ?? null, i.expiry_date ?? null,
-            po.supplier_id, i.purchase_price == null ? null : Number(i.purchase_price), poId, Number(rl.lastInsertRowid), recvLoc.id, at)
+            // Giá nhập của lô: ưu tiên giá nhập tay khi nhận; thiếu thì lấy giá
+            // trên dòng PO (unit_price) để định giá tồn GĐ5 có căn cứ.
+            po.supplier_id, i.purchase_price == null ? (line.unit_price ?? null) : Number(i.purchase_price), poId, Number(rl.lastInsertRowid), recvLoc.id, at)
           db.prepare('UPDATE po_lines SET qty_received = ?, qty_damaged = ? WHERE id = ?')
             .run(r6(line.qty_received + qtyReceived), r6(line.qty_damaged + qtyDamaged), line.id)
           line.qty_received = r6(line.qty_received + qtyReceived)
@@ -1416,6 +1653,7 @@ const server = http.createServer(async (req, res) => {
         }
         db.prepare('UPDATE lot_counter SET n = ? WHERE id = 1').run(nextLot)
         const done = poLines.every((l) => r6(l.qty_received) + EPS >= l.qty_ordered)
+        poReachedReceived = done
         db.prepare('UPDATE purchase_orders SET status = ?, updated_at = ? WHERE id = ?').run(done ? 'RECEIVED' : 'PARTIAL', at, poId)
         db.exec('COMMIT')
       } catch (e) {
@@ -1426,6 +1664,14 @@ const server = http.createServer(async (req, res) => {
         for (const m of movements) applyMovementTxn(m, s.username)
       } catch (e) {
         return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      // GĐ5: PO nhận đủ -> webhook po.received (lỗi webhook không chặn nghiệp vụ).
+      if (poReachedReceived) {
+        fireWebhooks('po.received', {
+          po_id: poId, po_no: po.po_no, receipt_id: receiptId, receipt_no: receiptNo,
+          warehouse_id: po.warehouse_id,
+          lines: poLines.map((l) => ({ sku: l.sku, qty_ordered: l.qty_ordered, qty_received: l.qty_received })),
+        })
       }
       return sendJson(res, 201, { receipt_id: receiptId, receipt_no: receiptNo })
     }
@@ -1930,6 +2176,16 @@ const server = http.createServer(async (req, res) => {
         db.exec('ROLLBACK')
         return sendJson(res, 400, { error: 'ship_rejected', message: String(e.message || e) })
       }
+      // GĐ5: webhook shipment.shipped (bắn nền, lỗi không chặn nghiệp vụ).
+      fireWebhooks('shipment.shipped', {
+        shipment_id: shipmentId, shipment_no: shipmentNo,
+        order_id: orderId, order_no: full.order.order_no,
+        carrier_text: body.carrier_text ?? full.order.carrier_text ?? null,
+        tracking_text: body.tracking_text ?? null,
+        items: shippable.map((a) => ({
+          sku: a.sku, lot_id: a.lot_id, location_id: a.location_id, qty: r6(a.qty_picked - a.qty_shipped),
+        })),
+      })
       return sendJson(res, 201, { shipment_id: shipmentId, shipment_no: shipmentNo })
     }
     if (p === '/api/shipments' && req.method === 'GET') {
@@ -2611,6 +2867,10 @@ const server = http.createServer(async (req, res) => {
       if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
       const drafts = scanAlertsS(nowStamp().slice(0, 10))
       const at = nowStamp()
+      // GĐ5: nhớ các cảnh báo đang mở TRƯỚC lần quét này để biết CRITICAL nào là MỚI.
+      const openKeysBefore = new Set(
+        db.prepare("SELECT alert_key FROM alerts WHERE status IN ('NEW', 'ACK')").all().map((r) => r.alert_key),
+      )
       const upsert = db.prepare(`INSERT INTO alerts (alert_key, type, severity, sku, lot_id, location_id, message, status, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'NEW', ?, ?)
         ON CONFLICT(alert_key) DO UPDATE SET severity = excluded.severity, message = excluded.message,
@@ -2625,6 +2885,11 @@ const server = http.createServer(async (req, res) => {
           db.prepare("UPDATE alerts SET status = 'RESOLVED', resolved_at = ?, updated_at = ? WHERE id = ?").run(at, at, r.id)
           resolved++
         }
+      }
+      // GĐ5: có cảnh báo CRITICAL mới sau lần quét -> webhook alert.critical.
+      const newCritical = drafts.filter((d) => d.severity === 'CRITICAL' && !openKeysBefore.has(d.alert_key))
+      if (newCritical.length) {
+        fireWebhooks('alert.critical', { alerts: newCritical, found: drafts.length, resolved })
       }
       return sendJson(res, 200, { found: drafts.length, resolved, alerts: drafts })
     }
@@ -2649,6 +2914,152 @@ const server = http.createServer(async (req, res) => {
       db.prepare("UPDATE alerts SET status = 'ACK', ack_by = ?, ack_at = ?, updated_at = ? WHERE id = ?")
         .run(s.username, nowStamp(), nowStamp(), alert.id)
       return sendJson(res, 200, { id: alert.id, status: 'ACK' })
+    }
+
+    // ---------- Báo cáo GĐ5 (chỉ đọc; quyền reports_view; không bắt thiết bị
+    // vì báo cáo là việc văn phòng như portal — vẫn phải có phiên đăng nhập) ----------
+    if (p === '/api/reports/stock-card' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'reports_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền reports_view' })
+      const lotId = Number(url.searchParams.get('lot_id'))
+      if (!lotId) return sendJson(res, 400, { error: 'missing_lot', message: 'Thiếu tham số lot_id' })
+      const movements = db.prepare('SELECT * FROM stock_movements WHERE lot_id = ? ORDER BY created_at, id').all(lotId)
+      const card = buildStockCardS(movements)
+      const bal = db.prepare('SELECT COALESCE(SUM(on_hand), 0) AS oh FROM stock_balances WHERE lot_id = ?').get(lotId)
+      const lot = db.prepare('SELECT * FROM lots WHERE lot_id = ?').get(lotId)
+      return sendJson(res, 200, { lot_id: lotId, lot: lot ?? null, card, balances_on_hand: bal.oh })
+    }
+    if (p === '/api/reports/in-out' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'reports_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền reports_view' })
+      const from = url.searchParams.get('from') || '0000-01-01'
+      const to = url.searchParams.get('to') || '9999-12-31'
+      const whParam = url.searchParams.get('warehouse_id')
+      const warehouse_id = whParam ? Number(whParam) : null
+      const movements = db.prepare('SELECT * FROM stock_movements ORDER BY created_at, id').all()
+      const rows = buildInOutS(movements, { from, to, warehouse_id })
+      const balRows = warehouse_id != null
+        ? db.prepare('SELECT sku, SUM(on_hand) AS oh FROM stock_balances WHERE warehouse_id = ? GROUP BY sku').all(warehouse_id)
+        : db.prepare('SELECT sku, SUM(on_hand) AS oh FROM stock_balances GROUP BY sku').all()
+      const balances_on_hand = {}
+      for (const r of balRows) balances_on_hand[r.sku] = r.oh
+      return sendJson(res, 200, { from, to, warehouse_id, rows, balances_on_hand })
+    }
+    if (p === '/api/reports/valuation' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'reports_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền reports_view' })
+      const rows = db.prepare(`
+        SELECT b.lot_id AS lot_id, b.sku AS sku, l.purchase_price AS purchase_price,
+               l.expiry_date AS expiry_date, l.batch_no AS batch_no,
+               SUM(b.on_hand) AS on_hand, SUM(b.damaged) AS damaged
+        FROM stock_balances b LEFT JOIN lots l ON l.lot_id = b.lot_id
+        WHERE b.lot_id IS NOT NULL
+        GROUP BY b.lot_id, b.sku, l.purchase_price, l.expiry_date, l.batch_no`).all()
+      return sendJson(res, 200, buildValuationS(rows))
+    }
+    if (p === '/api/reports/reconciliation' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'reports_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền reports_view' })
+      const balRows = db.prepare('SELECT sku, SUM(on_hand) AS oh FROM stock_balances GROUP BY sku').all()
+      const ledger = {}
+      for (const r of balRows) ledger[r.sku] = r.oh
+      // Server kho KHÔNG quản lý luồng nạp file (inventory_rows nằm ở client
+      // standalone) -> phía file = rỗng; mọi SKU ledger là ONLY_LEDGER tại đây.
+      // Đối chiếu đầy đủ hai phía chạy ở trang Báo cáo của app standalone.
+      const rows = buildReconciliationS(ledger, {})
+      return sendJson(res, 200, { rows, file_source: 'not_managed_on_server' })
+    }
+    if (p === '/api/reports/journal' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'reports_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền reports_view' })
+      const conds = []; const binds = []
+      const from = url.searchParams.get('from'); const to = url.searchParams.get('to')
+      const type = url.searchParams.get('type'); const actor = url.searchParams.get('actor')
+      const sku = url.searchParams.get('sku')
+      if (from) { conds.push('substr(created_at, 1, 10) >= ?'); binds.push(from) }
+      if (to) { conds.push('substr(created_at, 1, 10) <= ?'); binds.push(to) }
+      if (type) { conds.push('type = ?'); binds.push(type) }
+      if (actor) { conds.push('actor = ?'); binds.push(actor) }
+      if (sku) { conds.push('UPPER(TRIM(sku)) = UPPER(TRIM(?))'); binds.push(sku) }
+      const limit = Math.min(2000, Math.max(1, Number(url.searchParams.get('limit') || 500)))
+      const rows = db.prepare(`SELECT * FROM stock_movements ${conds.length ? `WHERE ${conds.join(' AND ')}` : ''} ORDER BY id DESC LIMIT ?`)
+        .all(...binds, limit)
+      return sendJson(res, 200, { movements: rows })
+    }
+
+    // ---------- Webhook GĐ5 (quản trị: webhooks_manage; xem log: + reports_view) ----------
+    if (p === '/api/webhooks' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'webhooks_manage') && !can(s.role, 'reports_view')) {
+        return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền webhooks_manage/reports_view' })
+      }
+      const rows = db.prepare('SELECT * FROM webhook_configs ORDER BY id').all()
+      return sendJson(res, 200, { webhooks: rows.map(webhookPublic) })
+    }
+    if (p === '/api/webhooks' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'webhooks_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền webhooks_manage' })
+      const body = await readBody(req)
+      const name = String(body.name || '').trim()
+      const hookUrl = String(body.url || '').trim()
+      if (!name) return sendJson(res, 400, { error: 'invalid', message: 'Thiếu tên webhook' })
+      let parsed
+      try { parsed = new URL(hookUrl) } catch { return sendJson(res, 400, { error: 'invalid_url', message: 'URL webhook không hợp lệ' }) }
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        return sendJson(res, 400, { error: 'invalid_url', message: 'URL webhook phải là http/https' })
+      }
+      const events = (Array.isArray(body.events) ? body.events : []).filter((e) => WEBHOOK_EVENTS.includes(e))
+      if (!events.length) return sendJson(res, 400, { error: 'invalid_events', message: 'Chọn ít nhất một sự kiện hợp lệ' })
+      const at = nowStamp()
+      const info = db.prepare(`INSERT INTO webhook_configs (name, url, events_json, secret, enabled, created_at, updated_at, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(name, hookUrl, JSON.stringify(events), body.secret ? String(body.secret) : null, body.enabled === false ? 0 : 1, at, at, s.username)
+      const cfg = db.prepare('SELECT * FROM webhook_configs WHERE id = ?').get(Number(info.lastInsertRowid))
+      return sendJson(res, 201, webhookPublic(cfg))
+    }
+    if (p === '/api/webhooks/log' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'webhooks_manage') && !can(s.role, 'reports_view')) {
+        return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền webhooks_manage/reports_view' })
+      }
+      const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 100)))
+      const rows = db.prepare('SELECT * FROM webhook_log ORDER BY id DESC LIMIT ?').all(limit)
+      return sendJson(res, 200, { log: rows })
+    }
+    const webhookIdMatch = /^\/api\/webhooks\/(\d+)$/.exec(p)
+    if (webhookIdMatch && (req.method === 'PUT' || req.method === 'DELETE')) {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'webhooks_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền webhooks_manage' })
+      const cfg = db.prepare('SELECT * FROM webhook_configs WHERE id = ?').get(Number(webhookIdMatch[1]))
+      if (!cfg) return sendJson(res, 404, { error: 'webhook_not_found', message: 'Không tìm thấy webhook' })
+      if (req.method === 'DELETE') {
+        db.prepare('DELETE FROM webhook_configs WHERE id = ?').run(cfg.id)
+        return sendJson(res, 200, { id: cfg.id, deleted: true })
+      }
+      const body = await readBody(req)
+      const events = Array.isArray(body.events)
+        ? body.events.filter((e) => WEBHOOK_EVENTS.includes(e))
+        : JSON.parse(cfg.events_json || '[]')
+      db.prepare(`UPDATE webhook_configs SET name = ?, url = ?, events_json = ?, secret = ?, enabled = ?, updated_at = ? WHERE id = ?`)
+        .run(
+          body.name != null ? String(body.name) : cfg.name,
+          body.url != null ? String(body.url) : cfg.url,
+          JSON.stringify(events),
+          body.secret === undefined ? cfg.secret : (body.secret ? String(body.secret) : null),
+          body.enabled === undefined ? cfg.enabled : (body.enabled ? 1 : 0),
+          nowStamp(), cfg.id,
+        )
+      const updated = db.prepare('SELECT * FROM webhook_configs WHERE id = ?').get(cfg.id)
+      return sendJson(res, 200, webhookPublic(updated))
+    }
+    const webhookTest = /^\/api\/webhooks\/(\d+)\/test$/.exec(p)
+    if (webhookTest && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'webhooks_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền webhooks_manage' })
+      const cfg = db.prepare('SELECT * FROM webhook_configs WHERE id = ?').get(Number(webhookTest[1]))
+      if (!cfg) return sendJson(res, 404, { error: 'webhook_not_found', message: 'Không tìm thấy webhook' })
+      const result = await deliverWebhook(cfg, 'webhook.test', { message: 'Bắn thử từ Warehouse Server', by: s.username })
+      return sendJson(res, 200, { id: cfg.id, ...result })
     }
 
     if (p.startsWith('/api/') || p.startsWith('/federation/')) {

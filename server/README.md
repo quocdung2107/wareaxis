@@ -230,6 +230,38 @@ lý do khi thuộc nhóm bắt buộc.
 | `GET /api/portal/low-stock` | inventory_view | Tồn thấp tổng hợp; kho không chia sẻ có ghi chú riêng |
 | `GET /portal` | trang tĩnh | Trang cổng liên kho (HTML thuần, tự nhập token phiên) |
 
+## API báo cáo & webhook GĐ5
+
+Báo cáo chỉ đọc dữ liệu, quyền `reports_view` (đăng nhập phiên thường,
+không bắt thiết bị — việc văn phòng như portal):
+
+| Endpoint | Quyền | Mô tả |
+|---|---|---|
+| `GET /api/reports/stock-card?lot_id=` | reports_view | Thẻ kho của 1 lô: từng dòng biến động + tồn lũy kế + đối chứng tổng balances của lô |
+| `GET /api/reports/in-out?from&to&warehouse_id=` | reports_view | Nhập–Xuất–Tồn theo SKU trong kỳ (phân loại theo hiệu ứng on_hand: nhập = RECEIVE/RETURN_IN/ADJUST_IN/TRANSFER_IN, xuất = PICK/ADJUST_OUT/WRITE_OFF/TRANSFER_OUT) |
+| `GET /api/reports/valuation` | reports_view | Định giá tồn theo giá nhập từng lô; hàng hỏng tách cột; lô chưa có giá vào nhóm `unpriced` |
+| `GET /api/reports/reconciliation` | reports_view | Đối chiếu sổ cái ↔ file: phía server không quản lý nạp file nên mọi SKU là `ONLY_LEDGER` (trả kèm `file_source: not_managed_on_server`); đối chiếu hai phía đầy đủ ở trang Báo cáo của app |
+| `GET /api/reports/journal?from&to&type&actor&sku&limit=` | reports_view | Nhật ký biến động lọc theo kỳ/loại/người/SKU |
+
+Webhook — cấu hình chỉ `webhooks_manage` (quản trị kho); xem danh sách/log
+được thêm `reports_view`:
+
+| Endpoint | Quyền | Mô tả |
+|---|---|---|
+| `GET /api/webhooks` | webhooks_manage / reports_view | Danh sách cấu hình (không trả secret, chỉ `has_secret`) |
+| `POST /api/webhooks` | webhooks_manage | Tạo: `{name, url, events[], secret?, enabled?}` — events thuộc `shipment.shipped`, `po.received`, `alert.critical`, `webhook.test` |
+| `PUT /api/webhooks/:id` / `DELETE /api/webhooks/:id` | webhooks_manage | Sửa (secret: bỏ trống = giữ nguyên, `null` = xoá) / xoá |
+| `POST /api/webhooks/:id/test` | webhooks_manage | Bắn sự kiện `webhook.test` ngay và trả kết quả |
+| `GET /api/webhooks/log?limit=` | webhooks_manage / reports_view | Nhật ký các lần bắn (trạng thái, mã HTTP, lỗi, số lần thử) |
+
+Cách bắn: POST JSON `{event, at, data}` tới `url`, timeout 3 giây, lỗi thì
+thử lại 1 lần sau 1 giây. Nếu cấu hình có `secret`, header
+`X-WareAxis-Signature: sha256=<HMAC-SHA256(secret, thân tin)>` để phía nhận
+kiểm chứng; header `X-WareAxis-Event` mang tên sự kiện. Sự kiện thật:
+`shipment.shipped` (sau khi giao hàng thành công), `po.received` (PO nhận
+đủ, chuyển RECEIVED), `alert.critical` (sau quét cảnh báo có CRITICAL mới).
+Lỗi webhook **không** làm hỏng nghiệp vụ chính — chỉ ghi log.
+
 ## Kiểm thử server (cho người kỹ thuật)
 
 ```
@@ -245,7 +277,10 @@ duyệt áp chênh lệch → chuyển kho 2 bước → gợi ý đặt hàng �
 cảnh báo hết hạn/tồn thấp) → sao lưu → GĐ4 (tự mở thêm server B độc lập:
 B cấp khoá qua API → B nhận hàng → portal ở server chính thêm peer B →
 tra tồn chéo kho → chính sách tồn thấp → kill B kiểm tra cache "số liệu
-cũ" + trạng thái offline),
+cũ" + trạng thái offline) → GĐ5 (thẻ kho/nhập–xuất–tồn/định giá/đối chiếu/
+nhật ký trên dữ liệu tích lũy + webhook: mở listener tạm, đăng ký, bắn thử,
+giao một đơn nhỏ và kiểm listener nhận đúng 1 POST `shipment.shipped` kèm
+chữ ký HMAC khớp, log trạng thái ok),
 xong tự dọn. Không nằm trong `npm test` chính vì cần mở cổng mạng.
 
 ## Các biến môi trường

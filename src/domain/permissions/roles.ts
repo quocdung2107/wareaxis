@@ -41,6 +41,7 @@ export const PERMISSIONS = [
   'devices_manage', // duyệt / thu hồi thiết bị
   'backup_manage', // tạo & khôi phục sao lưu
   'federation_manage', // cấu hình liên kho
+  'webhooks_manage', // cấu hình webhook trạng thái (GĐ5) — chỉ KHO_ADMIN (qua ALL)
 ] as const
 
 export type Permission = (typeof PERMISSIONS)[number]
