@@ -1,0 +1,35 @@
+-- =====================================================================
+-- RECORDED PLACEHOLDER — KHÔNG ÁP LẠI, KHÔNG CHỨA SQL GỐC
+-- =====================================================================
+-- Migration này đã được áp trực tiếp trên Supabase (production) vào khoảng
+-- 2026-10-14, TRƯỚC khi repo có thư mục supabase/migrations/. SQL gốc
+-- không lưu trong repo và không khôi phục được từ code client.
+--
+-- Cần SQL thật? Export từ Supabase Dashboard (Database -> Migrations)
+-- hoặc `supabase db dump`, rồi thay phần mô tả bên dưới bằng SQL thật,
+-- giữ nguyên tên file này.
+--
+-- Thay đổi suy ra từ code client (bằng chứng):
+--   * src/features/orders/statusFlow.ts: chú thích "khớp change_status
+--     trong migration 20261014" -> suy ra: migration này tạo (hoặc sửa)
+--     RPC `change_status`.
+--   * Cách client gọi (Chat.tsx, OrderActions.tsx, api.ts):
+--       rpc('change_status', { p_order, p_status, p_note })
+--     -> RPC nhận 3 tham số: p_order (id đơn), p_status (trạng thái đích),
+--     p_note (ghi chú, nullable; bắt buộc khi lùi trạng thái theo UI).
+--   * Ma trận đích theo vai trò phía client (statusFlow.allowedTargets,
+--     chỉ là hiển thị — quyền thật nằm ở RPC):
+--       - admin / coordinator: mọi trạng thái trừ COMPLETED
+--         (COMPLETED đi qua RPC complete_order riêng).
+--       - operator (khi là người được gán): CONFIRMED, PICKING, DELIVERED.
+--       - driver (khi là người được gán): IN_TRANSIT.
+--       - không phải người được gán: không đổi được.
+--     Vòng đời: CREATED -> CONFIRMED -> PICKING -> IN_TRANSIT ->
+--     DELIVERED -> COMPLETED.
+--   * Mã lỗi phía client (features/orders/api.ts, ERRORS) gợi ý RPC trả
+--     lỗi dạng mã: forbidden, not_assignee, status_not_allowed,
+--     backward_needs_note_one_step... (tên mã suy từ client, không khẳng
+--     định đây là toàn bộ hợp đồng lỗi của RPC).
+--
+-- Ngoài các điểm trên, KHÔNG suy đoán thêm về thân hàm PL/pgSQL gốc.
+-- =====================================================================

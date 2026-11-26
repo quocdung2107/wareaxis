@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-50: #eef3fc;
+  --color-brand-100: #d9e4f8;
+  --color-brand-600: #2457c5;
+  --color-brand-700: #1d479f;
+  --color-brand-800: #17397f;
+}
+
+body {
+  font-size: 16px;
+  background: #f8fafc;
+  color: #0f172a;
+}
+
+@media print {
+  body {
+    background: #fff;
+    font-size: 10pt;
+  }
+  nav,
+  .no-print {
+    display: none !important;
+  }
+  main {
+    padding: 0 !important;
+  }
+  .rack-group {
+    break-after: page;
+  }
+  .rack-group:last-child {
+    break-after: auto;
+  }
+  thead {
+    display: table-header-group;
+  }
+  tr {
+    break-inside: avoid;
+  }
+  .label-sheet {
+    break-after: page;
+  }
+  .label-sheet:last-child {
+    break-after: auto;
+  }
+}

@@ -1,0 +1,436 @@
+// Lịch sử kiểm tồn / lấy hàng. Phần đầu là hàm thuần (test được dưới node);
+// phần CRUD import client/repo động vì client.ts tạo Web Worker khi import.
+import { csvSafe } from '../../features/excel-formatter/formatter.ts'
+import type { Cell } from '../excel/reader.ts'
+
+export interface CountLine { seq: number; expr: string; value: number }
+
+export interface CountSession {
+  id: number
+  sku: string
+  description: string
+  source: string
+  location: string
+  batch_no: string
+  uom: string
+  qty_system: number
+  qty_counted: number
+  diff: number
+  counted_at: string
+  note: string
+}
+
+export type CountInput = Omit<CountSession, 'id'> & { lines: { expr: string; value: number }[] }
+
+export interface Pick {
+  id: number
+  sku: string
+  description: string
+  source: string
+  location: string
+  batch_no: string
+  uom: string
+  qty: number
+  order_no: string | null
+  picked_at: string
+  note: string
+  /** Đơn picking (PK-xxxx) mà lần lấy này thuộc về; null/thiếu = lần lấy lẻ từ Tra SKU. */
+  pick_order_id?: number | null
+  /** Lô tồn (inventory_rows.lot_id) mà lần lấy trừ vào; null/thiếu = chưa rõ lô. */
+  lot_id?: number | null
+  /** Ngày SX của lô (JOIN inventory_rows theo lot_id); rỗng nếu lô không còn (kỳ cũ) hoặc chưa rõ lô. */
+  manuf_date?: string
+  /** Kỳ của lần lấy (null = chưa chuyển đổi). */
+  period?: number | null
+  /** true khi kỳ của lần lấy khác kỳ hiện tại của nguồn. */
+  closed?: boolean
+  /** Pick tự gán lô lúc nâng cấp, cần người dùng xác nhận. */
+  needs_review?: boolean
+}
+
+export type PickInput = Omit<Pick, 'id'>
+
+/** lot_id (tuỳ chọn): có thì đổi lô và xoá dấu "cần xác nhận"; không truyền thì giữ nguyên. */
+export type PickEdit = { qty: number; location: string; batch_no: string; note: string; picked_at: string; lot_id?: number | null }
+
+export interface HistoryFilter { sku?: string; from?: string; to?: string; pickOrderId?: number; allPeriods?: boolean } // from/to: YYYY-MM-DD
+
+// ---------- hàm thuần ----------
+
+const pad = (n: number) => String(n).padStart(2, '0')
+
+/** Giờ máy dạng 'YYYY-MM-DD HH:MM:SS' (cùng dạng sources.loaded_at). */
+export function nowLocal(d = new Date()): string {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+/** Khoá khớp vị trí: (nguồn, vị trí, batch); null/rỗng coi như nhau. */
+export const locKey = (source: string | null, location: string | null, batch: string | null) =>
+  `${source ?? ''}\u0001${location ?? ''}\u0001${batch ?? ''}`
+
+export interface PickLike { source: string | null; location: string | null; batch_no: string | null; qty: number | null; picked_at: string | null }
+
+/**
+ * Tổng "đã lấy" theo vị trí: chỉ tính picks có picked_at >= loaded_at của nguồn.
+ * loadedAt: tên nguồn -> loaded_at. Nguồn không còn thì không tính.
+ */
+export function sumPicked(picks: PickLike[], loadedAt: Record<string, string>): Map<string, number> {
+  const out = new Map<string, number>()
+  for (const p of picks) {
+    const la = loadedAt[p.source ?? '']
+    if (la === undefined || !p.picked_at || p.picked_at < la) continue
+    const k = locKey(p.source, p.location, p.batch_no)
+    out.set(k, (out.get(k) ?? 0) + (p.qty ?? 0))
+  }
+  return out
+}
+
+/**
+ * Tổng "đã lấy" theo lô (lot_id): chỉ picks có lot_id, picked_at >= loaded_at của nguồn.
+ * Pick chưa rõ lô (lot_id rỗng) không vào bản đồ này (vẫn tính ở tổng SKU).
+ */
+export function sumPickedByLot(picks: (PickLike & { lot_id?: number | null })[], loadedAt: Record<string, string>): Map<number, number> {
+  const out = new Map<number, number>()
+  for (const p of picks) {
+    if (p.lot_id == null) continue
+    const la = loadedAt[p.source ?? '']
+    if (la === undefined || !p.picked_at || p.picked_at < la) continue
+    out.set(p.lot_id, (out.get(p.lot_id) ?? 0) + (p.qty ?? 0))
+  }
+  return out
+}
+
+/** Tồn ước tính = tồn file - đã lấy (tồn rỗng coi là 0). */
+export const estimateStock = (qtySystem: number | null | undefined, picked: number) => (qtySystem ?? 0) - picked
+
+export interface SkuStockInfo { total: number; picked: number; estimate: number; hold: number }
+
+export const skuKey = (sku: string) => sku.trim().toUpperCase()
+
+/** Khoá số đếm: (nguồn, vị trí, batch, SKU); null/rỗng như nhau, SKU không phân biệt hoa thường. Không gồm warehouse. */
+export const countKey = (source: string | null, location: string | null, batch: string | null, sku: string | null) =>
+  `${locKey(source, location, batch)}${skuKey(sku ?? '')}`
+
+/** Mỗi khoá giữ lần đếm có counted_at mới nhất; hoà giờ thì id lớn hơn. */
+export function latestCounts(sessions: CountSession[]): Map<string, CountSession> {
+  const out = new Map<string, CountSession>()
+  for (const s of sessions) {
+    const k = countKey(s.source, s.location, s.batch_no, s.sku)
+    const cur = out.get(k)
+    if (!cur || s.counted_at > cur.counted_at || (s.counted_at === cur.counted_at && s.id > cur.id)) out.set(k, s)
+  }
+  return out
+}
+
+export interface CountLineLike { key: string; source?: string | null; location: string | null; batch_no: string | null; sku: string | null }
+
+/**
+ * Gán số đếm cho dòng phiếu: chỉ dòng ĐẦU của mỗi khoá (Vị trí, SKU, Batch) nhận số, dòng sau để trống.
+ * Quy tắc này áp cho cả khi gộp (merge) vì dòng gộp theo condition vẫn cùng khoá.
+ * opts.source: nguồn mặc định khi dòng không có source.
+ */
+export function assignCounts(
+  lines: CountLineLike[],
+  counted: Map<string, CountSession>,
+  opts: { merge?: boolean; source?: string | null } = {},
+): Map<string, number> {
+  const out = new Map<string, number>()
+  const seen = new Set<string>()
+  for (const l of lines) {
+    const k = countKey(l.source ?? opts.source ?? '', l.location, l.batch_no, l.sku)
+    if (seen.has(k)) continue
+    seen.add(k)
+    const c = counted.get(k)
+    if (c) out.set(l.key, c.qty_counted)
+  }
+  return out
+}
+
+/**
+ * Hold = mọi lần lấy (lẻ hoặc thuộc đơn picking). Hiện luôn true; hàm tách riêng
+ * ("hold mở") để sau này lọc theo trạng thái đơn picking.
+ */
+const holdOf = (_p: { pick_order_id?: number | null }) => true
+
+/**
+ * Tồn theo SKU (mọi nguồn/vị trí): total = tổng qty_system; picked = picks >= loaded_at của nguồn;
+ * estimate = total - picked (có thể âm); hold = picked (mọi lần lấy, xem holdOf).
+ */
+export function skuStockInfo(
+  rows: { sku: string; qty_system: number | null }[],
+  picks: (PickLike & { sku: string; pick_order_id?: number | null })[],
+  loadedAt: Record<string, string>,
+): Map<string, SkuStockInfo> {
+  const out = new Map<string, SkuStockInfo>()
+  const get = (sku: string) => {
+    const k = skuKey(sku)
+    let v = out.get(k)
+    if (!v) { v = { total: 0, picked: 0, estimate: 0, hold: 0 }; out.set(k, v) }
+    return v
+  }
+  for (const r of rows) get(r.sku).total += r.qty_system ?? 0
+  for (const p of picks) {
+    const la = loadedAt[p.source ?? '']
+    if (la === undefined || !p.picked_at || p.picked_at < la) continue
+    const v = get(p.sku)
+    const q = p.qty ?? 0
+    v.picked += q
+    if (holdOf(p)) v.hold += q
+  }
+  for (const v of out.values()) v.estimate = estimateStock(v.total, v.picked)
+  return out
+}
+
+/** Nhãn kỳ: 'kỳ N' hoặc 'kỳ N (đã đóng)'; chưa có kỳ -> rỗng. */
+export const periodLabel = (period: number | null | undefined, closed?: boolean) =>
+  period == null ? '' : `kỳ ${period}${closed ? ' (đã đóng)' : ''}`
+
+/** Điều kiện lọc ngày theo ngày địa phương: [from 00:00:00, to 23:59:59]. */
+export function dateBounds(f: HistoryFilter): { from: string | null; to: string | null } {
+  return { from: f.from ? `${f.from} 00:00:00` : null, to: f.to ? `${f.to} 23:59:59` : null }
+}
+
+export const COUNT_EXPORT_HEADER = ['Giờ kiểm', 'SKU', 'Mô tả', 'Nguồn', 'Vị trí', 'Batch', 'ĐVT', 'Tồn hệ thống', 'Tổng đếm', 'Lệch', 'Phép tính', 'Ghi chú']
+export const PICK_EXPORT_HEADER = ['Giờ lấy', 'SKU', 'Mô tả', 'Nguồn', 'Vị trí', 'Batch', 'ĐVT', 'Số lượng', 'Số đơn', 'Ghi chú', 'Tổng hệ thống', 'Tồn ước tính', 'Hold', 'Ngày SX', 'Lô #', 'Kỳ']
+
+const safeRow = (cells: Cell[]): Cell[] => cells.map(csvSafe)
+
+/** Dựng dòng xuất (Excel/CSV): mọi ô qua csvSafe; dòng đầu là tiêu đề. */
+export function buildCountExport(sessions: CountSession[], lines: Record<number, CountLine[]> = {}): Cell[][] {
+  return [
+    COUNT_EXPORT_HEADER,
+    ...sessions.map((s) =>
+      safeRow([
+        s.counted_at, s.sku, s.description, s.source, s.location, s.batch_no, s.uom,
+        s.qty_system, s.qty_counted, s.diff,
+        (lines[s.id] ?? []).map((l) => `${l.expr} = ${l.value}`).join('; '),
+        s.note,
+      ]),
+    ),
+  ]
+}
+
+/** Cột KL thêm vào cuối khi truyền `weights`. */
+export const PICK_EXPORT_WEIGHT_HEADER = ['KL đơn vị (kg)', 'KL dòng (kg)']
+
+/**
+ * `weights` (tuỳ chọn): Map khoá SKU (bỏ khoảng trắng, hoa thường) -> kg/ĐVT. Có thì thêm 2 cột KL
+ * và dòng tổng cuối bảng; SKU thiếu KL để trống và không tính vào tổng.
+ */
+export function buildPickExport(picks: Pick[], info?: Map<string, SkuStockInfo>, weights?: Map<string, number>): Cell[][] {
+  let total = 0
+  const body = picks.map((p) => {
+    const i = info?.get(skuKey(p.sku))
+    const cells: Cell[] = [
+      p.picked_at, p.sku, p.description, p.source, p.location, p.batch_no, p.uom, p.qty, p.order_no ?? '', p.note,
+      i ? i.total : '', i ? i.estimate : '', i ? i.hold : '',
+      p.manuf_date ?? '', p.lot_id ?? '', periodLabel(p.period, p.closed) + (p.needs_review ? ' - cần xác nhận' : ''),
+    ]
+    if (weights) {
+      const kg = weights.get(skuKey(p.sku.replace(/\s+/g, '')))
+      const ok = kg !== undefined && kg > 0
+      if (ok) total += p.qty * kg
+      cells.push(ok ? kg : '', ok ? p.qty * kg : '')
+    }
+    return safeRow(cells)
+  })
+  if (!weights) return [PICK_EXPORT_HEADER, ...body]
+  const header = [...PICK_EXPORT_HEADER, ...PICK_EXPORT_WEIGHT_HEADER]
+  const sum: Cell[] = header.map(() => '')
+  sum[0] = 'Tổng khối lượng'
+  sum[sum.length - 1] = Math.round(total * 1000) / 1000
+  return [header, ...body, safeRow(sum)]
+}
+
+// ---------- CRUD (SQLite worker) ----------
+
+async function db() {
+  const [client, repo] = await Promise.all([import('../db/client.ts'), import('./repo.ts')])
+  await repo.initSchema()
+  return client
+}
+
+function where(col: string, f: HistoryFilter): { sql: string; bind: string[] } {
+  const parts: string[] = []
+  const bind: string[] = []
+  const { from, to } = dateBounds(f)
+  if (f.sku?.trim()) { parts.push('sku LIKE ?'); bind.push(`%${f.sku.trim()}%`) }
+  if (f.pickOrderId !== undefined) { parts.push('pick_order_id = ?'); bind.push(String(f.pickOrderId)) }
+  if (from) { parts.push(`${col} >= ?`); bind.push(from) }
+  if (to) { parts.push(`${col} <= ?`); bind.push(to) }
+  return { sql: parts.length ? 'WHERE ' + parts.join(' AND ') : '', bind }
+}
+
+const str = (v: unknown) => (v == null ? '' : String(v))
+
+/** Lưu một lần kiểm (luôn tạo bản ghi mới); trả về id. */
+export async function saveCount(c: CountInput): Promise<number> {
+  if (c.lines.length === 0) throw new Error('Chưa có dòng phép tính nào')
+  const { query, batch } = await db()
+  await query(
+    `INSERT INTO count_sessions (sku, description, source, location, batch_no, uom, qty_system, qty_counted, diff, counted_at, note)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    [c.sku, c.description, c.source, c.location, c.batch_no, c.uom, c.qty_system, c.qty_counted, c.diff, c.counted_at || nowLocal(), c.note],
+  )
+  const [{ id }] = await query('SELECT last_insert_rowid() AS id')
+  await batch(
+    c.lines.map((l, i) => ({
+      sql: 'INSERT INTO count_lines (session_id, seq, expr, value) VALUES (?,?,?,?)',
+      bind: [id as number, i + 1, l.expr, l.value],
+    })),
+  )
+  return id as number
+}
+
+export async function savePick(p: PickInput): Promise<number> {
+  if (!(p.qty > 0)) throw new Error('Số lượng phải lớn hơn 0')
+  const { query, batch } = await db()
+  await query(
+    `INSERT INTO picks (sku, description, source, location, batch_no, uom, qty, order_no, picked_at, note, pick_order_id, lot_id, period)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?, (SELECT period FROM sources WHERE name = ?))`,
+    [p.sku, p.description, p.source, p.location, p.batch_no, p.uom, p.qty, p.order_no?.trim() || null, p.picked_at || nowLocal(), p.note, p.pick_order_id ?? null, p.lot_id ?? null, p.source],
+  )
+  const [{ id }] = await query('SELECT last_insert_rowid() AS id')
+  // GĐ0: ghi sổ cái PICK song song (balances của ledger chưa phải nguồn hiển thị tồn,
+  // tồn ước tính vẫn tính từ file - picks như cũ). Balance ledger có thể chưa có RECEIVE
+  // tương ứng (hàng nạp bằng file) nên PICK bị chặn-âm sẽ bỏ qua ghi ledger, không chặn pick thật.
+  try {
+    const { recordMovement } = await import('./ledger.ts')
+    const [srcRow] = await query('SELECT period FROM sources WHERE name = ?', [p.source])
+    await recordMovement(
+      { query, batch },
+      {
+        type: 'PICK', warehouse_id: null, location_id: null, lot_id: p.lot_id ?? null,
+        sku: p.sku, qty: p.qty, doc_type: p.pick_order_id ? 'PICK_ORDER' : 'MANUAL',
+        doc_id: p.pick_order_id ?? null, actor: 'local',
+        period: (srcRow?.period as number | null) ?? null,
+        note: p.order_no ? `Đơn ${p.order_no}` : null,
+      },
+    )
+  } catch {
+    // Ledger là lớp đối chiếu ở GĐ0: lỗi ghi ledger không được phá luồng lấy hàng đang chạy.
+  }
+  return id as number
+}
+
+export async function listCounts(f: HistoryFilter = {}): Promise<CountSession[]> {
+  const { query } = await db()
+  const w = where('counted_at', f)
+  const rows = await query(`SELECT * FROM count_sessions ${w.sql} ORDER BY counted_at DESC, id DESC`, w.bind)
+  return rows.map((r) => ({
+    id: r.id as number, sku: str(r.sku), description: str(r.description), source: str(r.source),
+    location: str(r.location), batch_no: str(r.batch_no), uom: str(r.uom),
+    qty_system: (r.qty_system as number) ?? 0, qty_counted: (r.qty_counted as number) ?? 0, diff: (r.diff as number) ?? 0,
+    counted_at: str(r.counted_at), note: str(r.note),
+  }))
+}
+
+/** Lần đếm mới nhất của mọi khoá, không giới hạn ngày. */
+export async function listLatestCounts(): Promise<Map<string, CountSession>> {
+  return latestCounts(await listCounts())
+}
+
+export async function getCountLines(sessionId: number): Promise<CountLine[]> {
+  const { query } = await db()
+  const rows = await query('SELECT seq, expr, value FROM count_lines WHERE session_id = ? ORDER BY seq', [sessionId])
+  return rows.map((r) => ({ seq: r.seq as number, expr: str(r.expr), value: (r.value as number) ?? 0 }))
+}
+
+/** Dòng phép tính của nhiều phiên (phục vụ xuất file). */
+export async function getLinesFor(sessionIds: number[]): Promise<Record<number, CountLine[]>> {
+  const out: Record<number, CountLine[]> = {}
+  for (const id of sessionIds) out[id] = await getCountLines(id)
+  return out
+}
+
+export async function listPicks(f: HistoryFilter = {}): Promise<Pick[]> {
+  const { query } = await db()
+  const w = where('picked_at', f)
+  const cur = '(SELECT period FROM sources WHERE name = picks.source)'
+  let sql = w.sql
+  if (!f.allPeriods && f.pickOrderId === undefined) {
+    const cond = `(period IS NULL OR period = ${cur})`
+    sql = sql ? `${sql} AND ${cond}` : `WHERE ${cond}`
+  }
+  const rows = await query(
+    `SELECT picks.*, (SELECT manuf_date FROM inventory_rows WHERE lot_id = picks.lot_id LIMIT 1) AS lot_manuf, ${cur} AS cur_period
+     FROM picks ${sql} ORDER BY picked_at DESC, id DESC`, w.bind)
+  return rows.map((r) => ({
+    id: r.id as number, sku: str(r.sku), description: str(r.description), source: str(r.source),
+    location: str(r.location), batch_no: str(r.batch_no), uom: str(r.uom), qty: (r.qty as number) ?? 0,
+    order_no: r.order_no == null ? null : String(r.order_no), picked_at: str(r.picked_at), note: str(r.note),
+    pick_order_id: r.pick_order_id == null ? null : (r.pick_order_id as number),
+    lot_id: r.lot_id == null ? null : (r.lot_id as number),
+    manuf_date: str(r.lot_manuf),
+    period: r.period == null ? null : (r.period as number),
+    closed: r.period != null && r.cur_period != null && r.period !== r.cur_period,
+    needs_review: Number(r.needs_review) === 1,
+  }))
+}
+
+/** Sửa một lần lấy (số lượng, vị trí, lô, ghi chú, giờ). */
+export async function updatePick(id: number, p: PickEdit): Promise<void> {
+  if (!(p.qty > 0)) throw new Error('Số lượng phải lớn hơn 0')
+  const { query } = await db()
+  if (p.lot_id !== undefined) {
+    await query(
+      'UPDATE picks SET qty = ?, location = ?, batch_no = ?, note = ?, picked_at = ?, lot_id = ?, needs_review = 0 WHERE id = ?',
+      [p.qty, p.location, p.batch_no, p.note, p.picked_at, p.lot_id, id],
+    )
+    return
+  }
+  await query(
+    'UPDATE picks SET qty = ?, location = ?, batch_no = ?, note = ?, picked_at = ? WHERE id = ?',
+    [p.qty, p.location, p.batch_no, p.note, p.picked_at, id],
+  )
+}
+
+/** Xoá một lần kiểm cùng các dòng phép tính của nó. */
+export async function deleteCount(id: number) {
+  const { batch } = await db()
+  await batch([
+    { sql: 'DELETE FROM count_lines WHERE session_id = ?', bind: [id] },
+    { sql: 'DELETE FROM count_sessions WHERE id = ?', bind: [id] },
+  ])
+}
+
+export async function deletePick(id: number) {
+  const { query } = await db()
+  await query('DELETE FROM picks WHERE id = ?', [id])
+}
+
+/** "Đã lấy" của một SKU theo lô (key = lot_id), chỉ tính picks sau lần nạp file hiện tại. */
+export async function getPickedByLot(sku: string): Promise<Map<number, number>> {
+  const { query } = await db()
+  const picks = (await query('SELECT source, location, batch_no, qty, picked_at, lot_id FROM picks WHERE sku = ? AND lot_id IS NOT NULL', [sku])) as unknown as (PickLike & { lot_id: number })[]
+  const srcs = await query('SELECT name, loaded_at FROM sources')
+  const loadedAt = Object.fromEntries(srcs.map((s) => [s.name as string, (s.loaded_at as string) ?? '']))
+  return sumPickedByLot(picks, loadedAt)
+}
+
+/** Tồn/đã lấy/hold theo SKU (không phân biệt hoa thường), gom từ SQLite. */
+export async function getSkuStockInfo(skus: string[]): Promise<Map<string, SkuStockInfo>> {
+  const keys = [...new Set(skus.map(skuKey).filter(Boolean))]
+  if (keys.length === 0) return new Map()
+  const { query } = await db()
+  const srcs = await query('SELECT id, name, loaded_at FROM sources')
+  const nameById = new Map(srcs.map((s) => [s.id as number, s.name as string]))
+  const loadedAt = Object.fromEntries(srcs.map((s) => [s.name as string, (s.loaded_at as string) ?? '']))
+  const rows: { sku: string; qty_system: number | null }[] = []
+  const picks: (PickLike & { sku: string; pick_order_id: number | null })[] = []
+  for (let i = 0; i < keys.length; i += 200) {
+    const chunk = keys.slice(i, i + 200)
+    const ph = chunk.map(() => '?').join(',')
+    for (const r of await query(`SELECT sku, qty_system, source_id FROM inventory_rows WHERE UPPER(TRIM(sku)) IN (${ph})`, chunk)) {
+      if (nameById.has(r.source_id as number)) rows.push({ sku: str(r.sku), qty_system: (r.qty_system as number | null) ?? null })
+    }
+    for (const r of await query(`SELECT sku, source, location, batch_no, qty, picked_at, pick_order_id FROM picks WHERE UPPER(TRIM(sku)) IN (${ph})`, chunk)) {
+      picks.push({
+        sku: str(r.sku), source: str(r.source), location: str(r.location), batch_no: str(r.batch_no),
+        qty: (r.qty as number | null) ?? 0, picked_at: str(r.picked_at),
+        pick_order_id: r.pick_order_id == null ? null : (r.pick_order_id as number),
+      })
+    }
+  }
+  return skuStockInfo(rows, picks, loadedAt)
+}

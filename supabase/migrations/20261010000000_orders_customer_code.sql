@@ -1,0 +1,28 @@
+-- =====================================================================
+-- RECORDED PLACEHOLDER — KHÔNG ÁP LẠI, KHÔNG CHỨA SQL GỐC
+-- =====================================================================
+-- Migration này đã được áp trực tiếp trên Supabase (production) vào khoảng
+-- 2026-10-10, TRƯỚC khi repo có thư mục supabase/migrations/. SQL gốc
+-- không lưu trong repo và không khôi phục được từ code client.
+--
+-- Cần SQL thật? Export từ Supabase Dashboard (Database -> Migrations)
+-- hoặc `supabase db dump`, rồi thay phần mô tả bên dưới bằng SQL thật,
+-- giữ nguyên tên file này.
+--
+-- Thay đổi suy ra từ code client (bằng chứng):
+--   * src/features/orders/types.ts: trường `customer_code?: string` trên
+--     Order, chú thích "Mã KH (migration 20261010000000); undefined khi
+--     DB chưa áp dụng" -> suy ra: bảng orders có thêm cột customer_code
+--     (kiểu text, nullable).
+--   * src/features/orders/NewOrderForm.tsx: khi tạo đơn, client chỉ gửi
+--     tham số `p_customer_code` vào RPC tạo đơn NẾU có mã khách, để
+--     "tương thích RPC cũ (chưa có p_customer_code)" -> suy ra: RPC tạo
+--     đơn được sửa để nhận thêm tham số p_customer_code (tuỳ chọn).
+--   * src/features/orders/OrderActions.tsx: RPC `update_order_customer`
+--     được gọi với p_customer_name, p_customer_address và (khi đổi mã)
+--     p_customer_code -> suy ra: RPC update_order_customer cũng nhận
+--     thêm p_customer_code, hoặc được tạo ở migration này.
+--
+-- Ngoài các điểm trên, KHÔNG suy đoán thêm (không rõ constraint, index,
+-- hay thứ tự thao tác trong migration gốc).
+-- =====================================================================

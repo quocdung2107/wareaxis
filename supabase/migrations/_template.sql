@@ -1,0 +1,17 @@
+-- =====================================================================
+-- MẪU MIGRATION MỚI — copy file này, đổi tên thành:
+--   YYYYMMDDHHMMSS_mo_ta_ngan_bang_tieng_anh_khong_dau.sql
+-- Quy tắc:
+--   * Chỉ áp cho tính năng CHIA SẺ (orders / carriers / chat / vận tải).
+--     TUYỆT ĐỐI không tạo bảng tồn kho trên Supabase.
+--   * File đã áp lên production thì không sửa nữa; muốn đổi -> file mới.
+--   * Viết SQL idempotent khi có thể (IF NOT EXISTS, OR REPLACE...).
+--   * Ghi rõ ở đầu file: mục đích, bảng/RPC bị ảnh hưởng, code client nào
+--     phụ thuộc vào thay đổi này.
+-- =====================================================================
+-- Mục đích:
+-- Ảnh hưởng:
+-- Client phụ thuộc:
+-- ---------------------------------------------------------------------
+
+-- TODO: SQL ở đây
