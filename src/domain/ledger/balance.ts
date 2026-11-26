@@ -42,6 +42,15 @@ export function rebuildBalances(movements: readonly StockMovement[]): Map<string
       put(applyBucketDelta(dst, { on_hand: m.qty }, 'MOVE (cộng đích)'))
       continue
     }
+    if (m.type === 'PUTAWAY' && m.from_location_id != null && m.from_location_id !== m.location_id) {
+      // GĐ1: putaway khác vị trí — nguồn (khu nhận): on_hand- và inspect-;
+      // đích: on_hand+ (hàng thành khả dụng tại vị trí đích). Khớp recordMovement.
+      const src = get(m, m.from_location_id)
+      put(applyBucketDelta(src, { on_hand: -m.qty, inspect: -m.qty }, 'PUTAWAY (trừ nguồn)'))
+      const dst = get(m, m.location_id)
+      put(applyBucketDelta(dst, { on_hand: m.qty }, 'PUTAWAY (cộng đích)'))
+      continue
+    }
     if (m.type === 'REVERSAL') {
       const original = m.reverses_movement_id != null ? byId.get(m.reverses_movement_id) : undefined
       if (!original) throw new Error(`REVERSAL không tìm thấy movement gốc ${m.reverses_movement_id}`)

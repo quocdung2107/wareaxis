@@ -30,6 +30,7 @@ export const PERMISSIONS = [
   'inventory_adjust', // điều chỉnh / đóng băng / xuất hủy (vẫn cần reason_code)
   'inventory_transfer', // chuyển vị trí / chuyển kho
   'purchase_create', // tạo đơn mua PO / phiếu nhập dự kiến
+  'purchase_receive', // nhận hàng theo PO + QC (GĐ1)
   'reports_view', // xem báo cáo / thẻ kho
   'users_manage', // quản lý tài khoản local
   'devices_manage', // duyệt / thu hồi thiết bị
@@ -47,10 +48,10 @@ export const ROLE_PERMISSIONS: Record<LocalRole, readonly Permission[]> = {
   THU_KHO: [
     'inventory_view', 'inventory_receive', 'inventory_putaway', 'inventory_pick',
     'inventory_count', 'inventory_adjust', 'inventory_transfer',
-    'purchase_create', 'reports_view',
+    'purchase_create', 'purchase_receive', 'reports_view',
   ],
   NV_LAY_HANG: ['inventory_view', 'inventory_pick'],
-  NV_NHAN_HANG: ['inventory_view', 'inventory_receive', 'inventory_putaway'],
+  NV_NHAN_HANG: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'purchase_receive'],
   KE_TOAN_XEM: ['inventory_view', 'reports_view'],
 }
 

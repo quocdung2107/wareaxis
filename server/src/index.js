@@ -60,6 +60,31 @@ CREATE TABLE IF NOT EXISTS federation_peers (id INTEGER PRIMARY KEY AUTOINCREMEN
 CREATE TABLE IF NOT EXISTS federation_query_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_warehouse_code TEXT, query_type TEXT, sku TEXT, requested_by TEXT, result_status TEXT, created_at TEXT);
 `)
 
+// Schema GĐ1 (tương đương phần GĐ1 trong src/shared/inventory/repo.ts):
+// products/lots/purchase_orders/po_lines/receipts/receipt_lines + bộ đếm.
+// Hàng PO sống ở lots + stock_balances, KHÔNG vào tồn nạp file của client.
+db.exec(`
+CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, sku TEXT UNIQUE NOT NULL, name TEXT, category_id INTEGER, uom TEXT, barcode TEXT, track_lot INTEGER NOT NULL DEFAULT 0, track_expiry INTEGER NOT NULL DEFAULT 0, shelf_life_days INTEGER, active INTEGER NOT NULL DEFAULT 1, created_at TEXT, updated_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);
+CREATE TABLE IF NOT EXISTS lots (lot_id INTEGER PRIMARY KEY, sku TEXT NOT NULL, product_id INTEGER, batch_no TEXT, lot_no TEXT, manuf_date TEXT, expiry_date TEXT, supplier_id INTEGER, purchase_price REAL, status TEXT NOT NULL DEFAULT 'INSPECT', source_po_id INTEGER, source_receipt_line_id INTEGER, location_id INTEGER, created_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_lots_sku_expiry ON lots(sku, expiry_date);
+CREATE INDEX IF NOT EXISTS idx_lots_status ON lots(status);
+CREATE TABLE IF NOT EXISTS po_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO po_counter (id, n) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS lot_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO lot_counter (id, n) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS purchase_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, po_no TEXT UNIQUE NOT NULL, supplier_id INTEGER, warehouse_id INTEGER, expected_date TEXT, status TEXT NOT NULL DEFAULT 'DRAFT', total_amount REAL NOT NULL DEFAULT 0, note TEXT, created_at TEXT, updated_at TEXT, created_by TEXT);
+CREATE INDEX IF NOT EXISTS idx_po_status ON purchase_orders(status);
+CREATE TABLE IF NOT EXISTS po_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, po_id INTEGER NOT NULL, product_id INTEGER, sku TEXT NOT NULL, description TEXT, uom TEXT, qty_ordered REAL NOT NULL, qty_received REAL NOT NULL DEFAULT 0, qty_damaged REAL NOT NULL DEFAULT 0, unit_price REAL, expected_batch TEXT, note TEXT);
+CREATE TABLE IF NOT EXISTS receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_no TEXT UNIQUE NOT NULL, po_id INTEGER, warehouse_id INTEGER, received_by TEXT, received_at TEXT, status TEXT NOT NULL DEFAULT 'QC_PENDING', created_at TEXT);
+CREATE TABLE IF NOT EXISTS receipt_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_id INTEGER NOT NULL, po_line_id INTEGER, sku TEXT NOT NULL, qty_expected REAL NOT NULL DEFAULT 0, qty_received REAL NOT NULL DEFAULT 0, qty_good REAL NOT NULL DEFAULT 0, qty_damaged REAL NOT NULL DEFAULT 0, qty_shortage REAL NOT NULL DEFAULT 0, qty_more REAL NOT NULL DEFAULT 0, lot_id INTEGER, qc_status TEXT NOT NULL DEFAULT 'PENDING', qty_qc_pass REAL NOT NULL DEFAULT 0, qty_qc_fail REAL NOT NULL DEFAULT 0, qty_putaway REAL NOT NULL DEFAULT 0, damage_reason_code TEXT);
+`)
+{
+  const cols = db.prepare('PRAGMA table_info(stock_movements)').all().map((c) => c.name)
+  if (!cols.includes('into_inspect')) db.exec('ALTER TABLE stock_movements ADD COLUMN into_inspect INTEGER NOT NULL DEFAULT 0')
+  if (!cols.includes('from_inspect')) db.exec('ALTER TABLE stock_movements ADD COLUMN from_inspect INTEGER NOT NULL DEFAULT 0')
+}
+
 const REASONS = [
   ['COUNT_VARIANCE', 'Chênh lệch kiểm kê', 1], ['DAMAGED', 'Hàng hỏng / vỡ', 0],
   ['EXPIRED', 'Hết hạn dùng', 0], ['LOST', 'Thất lạc / mất hàng', 1],
@@ -101,15 +126,36 @@ const nowStamp = () => {
   }
 }
 
+// Seed kho mặc định + khu + vị trí (GĐ1) — CHỈ khi chưa có kho nào, giống client.
+{
+  const { n } = db.prepare('SELECT COUNT(*) AS n FROM warehouses').get()
+  if (n === 0) {
+    const at = nowStamp()
+    const w = db.prepare('INSERT INTO warehouses (code, name, is_default, created_at, updated_at, created_by) VALUES (?, ?, 1, ?, ?, ?)')
+      .run('MAIN', 'Kho chính', at, at, 'seed')
+    const whId = Number(w.lastInsertRowid)
+    const zr = db.prepare('INSERT INTO zones (warehouse_id, code, name, zone_type) VALUES (?, ?, ?, ?)')
+      .run(whId, 'RECEIVING', 'Khu nhận hàng', 'RECEIVING')
+    const zs = db.prepare('INSERT INTO zones (warehouse_id, code, name, zone_type) VALUES (?, ?, ?, ?)')
+      .run(whId, 'STORAGE', 'Khu lưu trữ', 'STORAGE')
+    const ins = db.prepare('INSERT INTO locations (warehouse_id, zone_id, code, loc_type, pick_sequence) VALUES (?, ?, ?, ?, ?)')
+    ins.run(whId, Number(zr.lastInsertRowid), 'NHAN-01', 'RECEIVING', 1)
+    ins.run(whId, Number(zs.lastInsertRowid), 'A01-01', 'PICKABLE', 101)
+    ins.run(whId, Number(zs.lastInsertRowid), 'A01-02', 'PICKABLE', 102)
+    console.log('[seed] Đã tạo kho chính + vị trí NHAN-01, A01-01, A01-02')
+  }
+}
+
 // ---------- Phân quyền (port từ src/domain/permissions/roles.ts + guard.ts) ----------
+// 'purchase_receive' bổ sung ở GĐ1 — nguồn: src/domain/permissions/roles.ts.
 const PERMISSIONS = ['inventory_view', 'inventory_receive', 'inventory_putaway', 'inventory_pick', 'inventory_count',
-  'inventory_adjust', 'inventory_transfer', 'purchase_create', 'reports_view', 'users_manage', 'devices_manage',
+  'inventory_adjust', 'inventory_transfer', 'purchase_create', 'purchase_receive', 'reports_view', 'users_manage', 'devices_manage',
   'backup_manage', 'federation_manage']
 const ROLE_PERMISSIONS = {
   KHO_ADMIN: PERMISSIONS,
-  THU_KHO: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'inventory_pick', 'inventory_count', 'inventory_adjust', 'inventory_transfer', 'purchase_create', 'reports_view'],
+  THU_KHO: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'inventory_pick', 'inventory_count', 'inventory_adjust', 'inventory_transfer', 'purchase_create', 'purchase_receive', 'reports_view'],
   NV_LAY_HANG: ['inventory_view', 'inventory_pick'],
-  NV_NHAN_HANG: ['inventory_view', 'inventory_receive', 'inventory_putaway'],
+  NV_NHAN_HANG: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'purchase_receive'],
   KE_TOAN_XEM: ['inventory_view', 'reports_view'],
 }
 const can = (role, perm) => (ROLE_PERMISSIONS[role] || []).includes(perm)
@@ -148,13 +194,17 @@ function applyToBalance(cur, m) {
   const b = { ...cur }
   const q = m.qty
   switch (m.type) {
-    case 'RECEIVE': case 'RETURN_IN': case 'ADJUST_IN': b.on_hand += q; break
+    // GĐ1: RECEIVE/RETURN_IN có cờ into_inspect -> cộng cả on_hand lẫn inspect.
+    case 'RECEIVE': case 'RETURN_IN':
+      b.on_hand += q; if (m.into_inspect) b.inspect += q; break
+    case 'ADJUST_IN': b.on_hand += q; break
     case 'PUTAWAY': b.inspect -= q; break
     case 'ALLOCATE': b.allocated += q; break
     case 'DEALLOCATE': b.allocated -= q; break
     case 'FREEZE': b.hold += q; break
     case 'UNFREEZE': b.hold -= q; break
-    case 'DAMAGE': b.damaged += q; break
+    // GĐ1: DAMAGE có cờ from_inspect -> lấy từ xô inspect sang damaged.
+    case 'DAMAGE': if (m.from_inspect) b.inspect -= q; b.damaged += q; break
     case 'TRANSFER_OUT': b.on_hand -= q; b.in_transit += q; break
     case 'TRANSFER_IN': b.in_transit -= q; b.on_hand += q; break
     case 'ADJUST_OUT': b.on_hand -= q; break
@@ -191,21 +241,44 @@ function saveBalance(row, b, at) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(b.warehouse_id, b.location_id, b.lot_id, b.sku, b.on_hand, b.allocated, b.hold, b.damaged, b.inspect, b.in_transit, at)
   }
 }
+const bucketsOf = (row) => row
+  ? { on_hand: row.on_hand, allocated: row.allocated, hold: row.hold, damaged: row.damaged, inspect: row.inspect, in_transit: row.in_transit }
+  : { on_hand: 0, allocated: 0, hold: 0, damaged: 0, inspect: 0, in_transit: 0 }
 /** Áp movement trong transaction BEGIN IMMEDIATE: hoặc ghi cả movement + balance, hoặc không gì cả. */
 function applyMovementTxn(m, actor) {
   validateMovement(m)
   const at = nowStamp()
   db.exec('BEGIN IMMEDIATE')
   try {
-    const row = findBalance(m, m.location_id ?? null)
-    const cur = row ? { on_hand: row.on_hand, allocated: row.allocated, hold: row.hold, damaged: row.damaged, inspect: row.inspect, in_transit: row.in_transit } : { on_hand: 0, allocated: 0, hold: 0, damaged: 0, inspect: 0, in_transit: 0 }
-    const next = applyToBalance(cur, m)
-    const info = db.prepare(`INSERT INTO stock_movements (movement_no, type, warehouse_id, location_id, from_location_id, lot_id, sku, qty,
-      qty_before, qty_after, doc_type, doc_id, doc_line_id, reason_code, note, actor, reverses_movement_id, period, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    // GĐ1: PUTAWAY khác vị trí = hai phía: nguồn {on_hand-, inspect-}, đích {on_hand+}.
+    const crossPutaway = m.type === 'PUTAWAY' && m.from_location_id != null && m.location_id != null
+      && Number(m.from_location_id) !== Number(m.location_id)
+    const insertMovement = (qtyBefore, qtyAfter) => db.prepare(`INSERT INTO stock_movements (movement_no, type, warehouse_id, location_id, from_location_id, lot_id, sku, qty,
+      qty_before, qty_after, doc_type, doc_id, doc_line_id, reason_code, note, actor, reverses_movement_id, period, created_at, into_inspect, from_inspect)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(m.movement_no ?? null, m.type, m.warehouse_id ?? null, m.location_id ?? null, m.from_location_id ?? null,
-        m.lot_id ?? null, String(m.sku), m.qty, cur.on_hand, next.on_hand, m.doc_type ?? null, m.doc_id ?? null,
-        m.doc_line_id ?? null, m.reason_code ?? null, m.note ?? null, actor, m.reverses_movement_id ?? null, m.period ?? null, at)
+        m.lot_id ?? null, String(m.sku), m.qty, qtyBefore, qtyAfter, m.doc_type ?? null, m.doc_id ?? null,
+        m.doc_line_id ?? null, m.reason_code ?? null, m.note ?? null, actor, m.reverses_movement_id ?? null, m.period ?? null, at,
+        m.into_inspect ? 1 : 0, m.from_inspect ? 1 : 0)
+    if (crossPutaway) {
+      const srcRow = findBalance(m, m.from_location_id)
+      const srcCur = bucketsOf(srcRow)
+      const srcNext = { ...srcCur, on_hand: r6(srcCur.on_hand - m.qty), inspect: r6(srcCur.inspect - m.qty) }
+      assertNonNegative(srcNext, m.type)
+      const dstRow = findBalance(m, m.location_id)
+      const dstCur = bucketsOf(dstRow)
+      const dstNext = { ...dstCur, on_hand: r6(dstCur.on_hand + m.qty) }
+      assertNonNegative(dstNext, m.type)
+      const info = insertMovement(dstCur.on_hand, dstNext.on_hand)
+      saveBalance(srcRow, { ...emptyBalance(m, m.from_location_id), ...srcNext }, at)
+      saveBalance(dstRow, { ...emptyBalance(m, m.location_id), ...dstNext }, at)
+      db.exec('COMMIT')
+      return { id: Number(info.lastInsertRowid), balance: { ...emptyBalance(m, m.location_id), ...dstNext, available: availableOf(dstNext) } }
+    }
+    const row = findBalance(m, m.location_id ?? null)
+    const cur = bucketsOf(row)
+    const next = applyToBalance(cur, m)
+    const info = insertMovement(cur.on_hand, next.on_hand)
     saveBalance(row, { ...emptyBalance(m, m.location_id ?? null), ...next }, at)
     db.exec('COMMIT')
     return { id: Number(info.lastInsertRowid), balance: { ...emptyBalance(m, m.location_id ?? null), ...next, available: availableOf(next) } }
@@ -265,6 +338,51 @@ function requireDevice(req, res) {
   const d = checkDevice(req)
   if (!d.ok) { sendJson(res, 403, { error: d.error, message: d.message }); return null }
   return d.device
+}
+
+// ---------- Inbound GĐ1 (port từ src/domain/inbound/* — giữ khớp bản TS) ----------
+const PO_MANUAL_TRANSITIONS = { DRAFT: ['SENT', 'CANCELLED'], SENT: ['CANCELLED'], RECEIVED: ['CLOSED'] }
+const NEVER_PUTAWAY_TYPES = new Set(['RECEIVING', 'DAMAGE', 'HOLD'])
+function defaultWarehouseId() {
+  const w = db.prepare('SELECT id FROM warehouses ORDER BY is_default DESC, id LIMIT 1').get()
+  return w ? w.id : null
+}
+function findReceivingLocation(warehouseId) {
+  let wh = warehouseId ?? defaultWarehouseId()
+  const row = wh != null
+    ? db.prepare("SELECT * FROM locations WHERE warehouse_id = ? AND loc_type = 'RECEIVING' AND active = 1 ORDER BY id LIMIT 1").get(wh)
+    : db.prepare("SELECT * FROM locations WHERE loc_type = 'RECEIVING' AND active = 1 ORDER BY id LIMIT 1").get()
+  if (!row) throw new Error('Chưa có vị trí nhận hàng (loại RECEIVING)')
+  return row
+}
+const qtyPendingQcS = (l) => r6(l.qty_received - l.qty_qc_pass - l.qty_qc_fail)
+const qtyAwaitingPutawayS = (l) => r6(l.qty_qc_pass - l.qty_putaway)
+function lotStatusAfterS(l) {
+  const qcDone = r6(l.qty_qc_pass + l.qty_qc_fail) + EPS >= l.qty_received
+  const putDone = r6(l.qty_putaway) + EPS >= l.qty_qc_pass
+  if (!qcDone || !putDone) return 'INSPECT'
+  return l.qty_qc_pass > 0 ? 'AVAILABLE' : 'DAMAGED'
+}
+/** Sau QC/putaway: cập nhật trạng thái lô + đóng phiếu nhận khi mọi dòng xong. */
+function refreshReceiptAndLot(receiptLineId) {
+  const line = db.prepare('SELECT * FROM receipt_lines WHERE id = ?').get(receiptLineId)
+  if (!line) return
+  if (line.lot_id != null) {
+    db.prepare('UPDATE lots SET status = ? WHERE lot_id = ?').run(lotStatusAfterS(line), line.lot_id)
+  }
+  const siblings = db.prepare('SELECT * FROM receipt_lines WHERE receipt_id = ?').all(line.receipt_id)
+  if (siblings.every((l) => qtyPendingQcS(l) <= 0 && qtyAwaitingPutawayS(l) <= 0)) {
+    db.prepare("UPDATE receipts SET status = 'DONE' WHERE id = ?").run(line.receipt_id)
+  }
+}
+function getPoFull(id) {
+  const order = db.prepare(`SELECT po.*, COALESCE(s.name, '') AS supplier_name FROM purchase_orders po
+    LEFT JOIN suppliers s ON s.id = po.supplier_id WHERE po.id = ?`).get(id)
+  if (!order) return null
+  const lines = db.prepare('SELECT * FROM po_lines WHERE po_id = ? ORDER BY id').all(id)
+  const receipts = db.prepare('SELECT * FROM receipts WHERE po_id = ? ORDER BY id').all(id)
+    .map((r) => ({ ...r, lines: db.prepare('SELECT * FROM receipt_lines WHERE receipt_id = ? ORDER BY id').all(r.id) }))
+  return { order, lines, receipts }
 }
 
 // ---------- Router ----------
@@ -410,6 +528,255 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
       }
+    }
+
+    // --- Inbound GĐ1: PO -> nhận -> QC -> putaway (cần đăng nhập + thiết bị duyệt) ---
+    if (p === '/api/purchase-orders' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const status = url.searchParams.get('status')
+      const rows = status
+        ? db.prepare(`SELECT po.*, COALESCE(s.name, '') AS supplier_name FROM purchase_orders po LEFT JOIN suppliers s ON s.id = po.supplier_id WHERE po.status = ? ORDER BY po.id DESC`).all(status)
+        : db.prepare(`SELECT po.*, COALESCE(s.name, '') AS supplier_name FROM purchase_orders po LEFT JOIN suppliers s ON s.id = po.supplier_id ORDER BY po.id DESC`).all()
+      return sendJson(res, 200, { purchase_orders: rows })
+    }
+    if (p === '/api/purchase-orders' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'purchase_create')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền purchase_create' })
+      const body = await readBody(req)
+      const lines = Array.isArray(body.lines) ? body.lines : []
+      if (!lines.length) return sendJson(res, 400, { error: 'invalid_po', message: 'PO phải có ít nhất 1 dòng hàng' })
+      for (const l of lines) {
+        if (!String(l.sku || '').trim()) return sendJson(res, 400, { error: 'invalid_po', message: 'Dòng PO thiếu SKU' })
+        if (!Number.isFinite(Number(l.qty_ordered)) || Number(l.qty_ordered) <= 0) {
+          return sendJson(res, 400, { error: 'invalid_po', message: `Dòng ${l.sku}: số lượng đặt phải lớn hơn 0` })
+        }
+      }
+      const at = nowStamp()
+      const warehouseId = body.warehouse_id ?? defaultWarehouseId()
+      const total = r6(lines.reduce((sum, l) => sum + Number(l.qty_ordered) * (Number(l.unit_price) || 0), 0))
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        db.prepare('UPDATE po_counter SET n = n + 1 WHERE id = 1').run()
+        const info = db.prepare(`INSERT INTO purchase_orders (po_no, supplier_id, warehouse_id, expected_date, status, total_amount, note, created_at, updated_at, created_by)
+          VALUES ((SELECT 'PO-' || printf('%04d', n) FROM po_counter WHERE id = 1), ?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)`)
+          .run(body.supplier_id ?? null, warehouseId, body.expected_date ?? null, total, body.note ?? null, at, at, s.username)
+        const poId = Number(info.lastInsertRowid)
+        const upsertProduct = db.prepare(`INSERT INTO products (sku, name, uom, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(sku) DO UPDATE SET name = COALESCE(NULLIF(excluded.name, ''), products.name), updated_at = excluded.updated_at`)
+        const insLine = db.prepare(`INSERT INTO po_lines (po_id, product_id, sku, description, uom, qty_ordered, unit_price, expected_batch, note)
+          VALUES (?, (SELECT id FROM products WHERE sku = ?), ?, ?, ?, ?, ?, ?, ?)`)
+        for (const l of lines) {
+          const sku = String(l.sku).trim()
+          upsertProduct.run(sku, l.description ?? '', l.uom ?? '', at, at)
+          insLine.run(poId, sku, sku, l.description ?? null, l.uom ?? null, Number(l.qty_ordered),
+            l.unit_price == null ? null : Number(l.unit_price), l.expected_batch ?? null, l.note ?? null)
+        }
+        db.exec('COMMIT')
+        const po = db.prepare('SELECT po_no FROM purchase_orders WHERE id = ?').get(poId)
+        return sendJson(res, 201, { id: poId, po_no: po.po_no })
+      } catch (e) {
+        db.exec('ROLLBACK')
+        return sendJson(res, 400, { error: 'po_rejected', message: String(e.message || e) })
+      }
+    }
+    const poIdMatch = /^\/api\/purchase-orders\/(\d+)$/.exec(p)
+    if (poIdMatch && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const full = getPoFull(Number(poIdMatch[1]))
+      if (!full) return sendJson(res, 404, { error: 'po_not_found', message: 'Không tìm thấy PO' })
+      return sendJson(res, 200, full)
+    }
+    const poTransition = /^\/api\/purchase-orders\/(\d+)\/transition$/.exec(p)
+    if (poTransition && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'purchase_create')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền purchase_create' })
+      const body = await readBody(req)
+      const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(Number(poTransition[1]))
+      if (!po) return sendJson(res, 404, { error: 'po_not_found', message: 'Không tìm thấy PO' })
+      const allowed = PO_MANUAL_TRANSITIONS[po.status] || []
+      if (!allowed.includes(String(body.to))) {
+        return sendJson(res, 400, { error: 'invalid_transition', message: `Không chuyển được PO từ ${po.status} sang ${body.to}` })
+      }
+      db.prepare('UPDATE purchase_orders SET status = ?, updated_at = ? WHERE id = ?').run(String(body.to), nowStamp(), po.id)
+      return sendJson(res, 200, { id: po.id, status: String(body.to) })
+    }
+    const poReceive = /^\/api\/purchase-orders\/(\d+)\/receive$/.exec(p)
+    if (poReceive && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'purchase_receive')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền purchase_receive' })
+      const body = await readBody(req)
+      const poId = Number(poReceive[1])
+      const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(poId)
+      if (!po) return sendJson(res, 404, { error: 'po_not_found', message: 'Không tìm thấy PO' })
+      if (!['SENT', 'PARTIAL'].includes(po.status)) {
+        return sendJson(res, 400, { error: 'po_not_receivable', message: `PO đang ở trạng thái ${po.status}, chưa nhận hàng được` })
+      }
+      let recvLoc
+      try { recvLoc = findReceivingLocation(po.warehouse_id) } catch (e) {
+        return sendJson(res, 400, { error: 'no_receiving_location', message: String(e.message || e) })
+      }
+      const poLines = db.prepare('SELECT * FROM po_lines WHERE po_id = ? ORDER BY id').all(poId)
+      const inputs = (Array.isArray(body.lines) ? body.lines : []).filter((i) => Number(i.qty_received) > 0)
+      if (!inputs.length) return sendJson(res, 400, { error: 'nothing_received', message: 'Chưa nhập số lượng thực nhận cho dòng nào' })
+      const seen = new Set()
+      for (const i of inputs) {
+        const line = poLines.find((l) => l.id === Number(i.po_line_id))
+        if (!line) return sendJson(res, 400, { error: 'invalid_line', message: `Dòng PO ${i.po_line_id} không thuộc đơn này` })
+        if (seen.has(line.id)) return sendJson(res, 400, { error: 'invalid_line', message: `Dòng ${line.sku} bị nhập hai lần` })
+        seen.add(line.id)
+        if (Number(i.qty_damaged || 0) > Number(i.qty_received)) {
+          return sendJson(res, 400, { error: 'invalid_line', message: `Dòng ${line.sku}: số hỏng lớn hơn số thực nhận` })
+        }
+      }
+      const at = nowStamp()
+      let receiptId; let receiptNo; const movements = []
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        const { n: nReceipts } = db.prepare('SELECT COUNT(*) AS n FROM receipts WHERE po_id = ?').get(poId)
+        receiptNo = `${po.po_no}-R${nReceipts + 1}`
+        const rInfo = db.prepare(`INSERT INTO receipts (receipt_no, po_id, warehouse_id, received_by, received_at, status, created_at)
+          VALUES (?, ?, ?, ?, ?, 'QC_PENDING', ?)`).run(receiptNo, poId, po.warehouse_id, s.username, at, at)
+        receiptId = Number(rInfo.lastInsertRowid)
+        const { n: lotCounter } = db.prepare('SELECT n FROM lot_counter WHERE id = 1').get()
+        let nextLot = lotCounter
+        const insRl = db.prepare(`INSERT INTO receipt_lines (receipt_id, po_line_id, sku, qty_expected, qty_received, qty_good, qty_damaged, qty_shortage, qty_more, lot_id, qc_status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`)
+        const insLot = db.prepare(`INSERT INTO lots (lot_id, sku, product_id, batch_no, lot_no, manuf_date, expiry_date, supplier_id, purchase_price, status, source_po_id, source_receipt_line_id, location_id, created_at)
+          VALUES (?, ?, (SELECT id FROM products WHERE sku = ?), ?, ?, ?, ?, ?, ?, 'INSPECT', ?, ?, ?, ?)`)
+        for (const i of inputs) {
+          const line = poLines.find((l) => l.id === Number(i.po_line_id))
+          const qtyReceived = Number(i.qty_received); const qtyDamaged = Number(i.qty_damaged || 0)
+          const qtyExpected = Math.max(0, r6(line.qty_ordered - line.qty_received))
+          const lotId = ++nextLot
+          const rl = insRl.run(receiptId, line.id, line.sku, qtyExpected, qtyReceived, r6(qtyReceived - qtyDamaged), qtyDamaged,
+            Math.max(0, r6(qtyExpected - qtyReceived)), Math.max(0, r6(qtyReceived - qtyExpected)), lotId)
+          insLot.run(lotId, line.sku, line.sku, i.batch_no ?? null, i.lot_no ?? null, i.manuf_date ?? null, i.expiry_date ?? null,
+            po.supplier_id, i.purchase_price == null ? null : Number(i.purchase_price), poId, Number(rl.lastInsertRowid), recvLoc.id, at)
+          db.prepare('UPDATE po_lines SET qty_received = ?, qty_damaged = ? WHERE id = ?')
+            .run(r6(line.qty_received + qtyReceived), r6(line.qty_damaged + qtyDamaged), line.id)
+          line.qty_received = r6(line.qty_received + qtyReceived)
+          movements.push({
+            type: 'RECEIVE', sku: line.sku, lot_id: lotId, qty: qtyReceived, warehouse_id: po.warehouse_id,
+            location_id: recvLoc.id, into_inspect: true, doc_type: 'RECEIPT', doc_id: receiptId,
+          })
+        }
+        db.prepare('UPDATE lot_counter SET n = ? WHERE id = 1').run(nextLot)
+        const done = poLines.every((l) => r6(l.qty_received) + EPS >= l.qty_ordered)
+        db.prepare('UPDATE purchase_orders SET status = ?, updated_at = ? WHERE id = ?').run(done ? 'RECEIVED' : 'PARTIAL', at, poId)
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        return sendJson(res, 400, { error: 'receive_rejected', message: String(e.message || e) })
+      }
+      try {
+        for (const m of movements) applyMovementTxn(m, s.username)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      return sendJson(res, 201, { receipt_id: receiptId, receipt_no: receiptNo })
+    }
+    const receiptQc = /^\/api\/receipts\/(\d+)\/qc$/.exec(p)
+    if (receiptQc && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_receive')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_receive' })
+      const body = await readBody(req)
+      const receipt = db.prepare('SELECT * FROM receipts WHERE id = ?').get(Number(receiptQc[1]))
+      if (!receipt) return sendJson(res, 404, { error: 'receipt_not_found', message: 'Không tìm thấy phiếu nhận' })
+      const line = db.prepare('SELECT * FROM receipt_lines WHERE id = ? AND receipt_id = ?').get(Number(body.receipt_line_id), receipt.id)
+      if (!line) return sendJson(res, 404, { error: 'receipt_line_not_found', message: 'Không tìm thấy dòng phiếu nhận' })
+      const qtyPass = Number(body.qty_pass || 0); const qtyFail = Number(body.qty_fail || 0)
+      if (qtyPass + qtyFail <= 0) return sendJson(res, 400, { error: 'invalid_qc', message: 'Chưa nhập số lượng QC' })
+      if (r6(qtyPass + qtyFail) > qtyPendingQcS(line) + EPS) {
+        return sendJson(res, 400, { error: 'invalid_qc', message: `QC vượt số đang chờ (${qtyPendingQcS(line)})` })
+      }
+      if (qtyFail > 0 && !body.reason_code) {
+        return sendJson(res, 400, { error: 'invalid_qc', message: 'Có hàng hỏng khi QC: bắt buộc chọn lý do' })
+      }
+      try {
+        if (qtyFail > 0) {
+          const recvLoc = findReceivingLocation(receipt.warehouse_id)
+          applyMovementTxn({
+            type: 'DAMAGE', sku: line.sku, lot_id: line.lot_id, qty: qtyFail, warehouse_id: receipt.warehouse_id,
+            location_id: recvLoc.id, from_inspect: true, reason_code: String(body.reason_code),
+            doc_type: 'RECEIPT', doc_id: receipt.id, doc_line_id: line.id,
+          }, s.username)
+        }
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      const newPass = r6(line.qty_qc_pass + qtyPass); const newFail = r6(line.qty_qc_fail + qtyFail)
+      const done = r6(newPass + newFail) + EPS >= line.qty_received
+      const qcStatus = !done ? 'PARTIAL' : (newFail === 0 ? 'PASS' : (newPass === 0 ? 'FAIL' : 'PARTIAL'))
+      db.prepare(`UPDATE receipt_lines SET qty_qc_pass = ?, qty_qc_fail = ?, qc_status = ?,
+        damage_reason_code = COALESCE(?, damage_reason_code) WHERE id = ?`)
+        .run(newPass, newFail, qcStatus, qtyFail > 0 ? String(body.reason_code) : null, line.id)
+      refreshReceiptAndLot(line.id)
+      return sendJson(res, 200, { receipt_line_id: line.id, qc_status: qcStatus })
+    }
+    const receiptPutaway = /^\/api\/receipts\/(\d+)\/putaway$/.exec(p)
+    if (receiptPutaway && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_putaway')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_putaway' })
+      const body = await readBody(req)
+      const receipt = db.prepare('SELECT * FROM receipts WHERE id = ?').get(Number(receiptPutaway[1]))
+      if (!receipt) return sendJson(res, 404, { error: 'receipt_not_found', message: 'Không tìm thấy phiếu nhận' })
+      const line = db.prepare('SELECT * FROM receipt_lines WHERE id = ? AND receipt_id = ?').get(Number(body.receipt_line_id), receipt.id)
+      if (!line) return sendJson(res, 404, { error: 'receipt_line_not_found', message: 'Không tìm thấy dòng phiếu nhận' })
+      const qty = Number(body.qty || 0)
+      if (qty <= 0 || r6(qty) > qtyAwaitingPutawayS(line) + EPS) {
+        return sendJson(res, 400, { error: 'invalid_putaway', message: `Số cất phải > 0 và không vượt số chờ cất (${qtyAwaitingPutawayS(line)})` })
+      }
+      const dest = db.prepare('SELECT * FROM locations WHERE id = ?').get(Number(body.to_location_id))
+      if (!dest || dest.active !== 1) return sendJson(res, 400, { error: 'invalid_putaway', message: 'Vị trí đích không tồn tại hoặc đang tắt' })
+      if (NEVER_PUTAWAY_TYPES.has(dest.loc_type)) {
+        return sendJson(res, 400, { error: 'invalid_putaway', message: `Không cất hàng vào vị trí loại ${dest.loc_type}` })
+      }
+      let recvLoc
+      try { recvLoc = findReceivingLocation(receipt.warehouse_id) } catch (e) {
+        return sendJson(res, 400, { error: 'no_receiving_location', message: String(e.message || e) })
+      }
+      if (dest.id === recvLoc.id) return sendJson(res, 400, { error: 'invalid_putaway', message: 'Vị trí đích trùng vị trí nhận hàng' })
+      try {
+        applyMovementTxn({
+          type: 'PUTAWAY', sku: line.sku, lot_id: line.lot_id, qty, warehouse_id: receipt.warehouse_id,
+          from_location_id: recvLoc.id, location_id: dest.id, doc_type: 'RECEIPT', doc_id: receipt.id, doc_line_id: line.id,
+        }, s.username)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      db.prepare('UPDATE receipt_lines SET qty_putaway = ? WHERE id = ?').run(r6(line.qty_putaway + qty), line.id)
+      if (line.lot_id != null) db.prepare('UPDATE lots SET location_id = ? WHERE lot_id = ?').run(dest.id, line.lot_id)
+      refreshReceiptAndLot(line.id)
+      return sendJson(res, 200, { receipt_line_id: line.id, qty_putaway: r6(line.qty_putaway + qty) })
+    }
+    if (p === '/api/lots' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const sku = url.searchParams.get('sku')
+      const rows = sku
+        ? db.prepare('SELECT * FROM lots WHERE UPPER(TRIM(sku)) = UPPER(TRIM(?)) ORDER BY lot_id').all(sku)
+        : db.prepare('SELECT * FROM lots ORDER BY lot_id').all()
+      return sendJson(res, 200, { lots: rows })
+    }
+    if (p === '/api/locations' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      return sendJson(res, 200, {
+        warehouses: db.prepare('SELECT * FROM warehouses ORDER BY id').all(),
+        zones: db.prepare('SELECT * FROM zones ORDER BY id').all(),
+        locations: db.prepare('SELECT * FROM locations ORDER BY pick_sequence, code').all(),
+      })
     }
 
     if (p.startsWith('/api/') || p.startsWith('/federation/')) {

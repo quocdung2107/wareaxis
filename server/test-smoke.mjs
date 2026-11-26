@@ -107,6 +107,82 @@ try {
   assert.ok(!('purchase_price' in fed.json) && !JSON.stringify(fed.json).includes('supplier'), 'federation không lộ giá/NCC')
   console.log('✓ federation ping + availability (có khoá mới xem được)')
 
+  // --- GĐ1: PO -> gửi -> nhận thiếu + có hỏng -> QC -> putaway -> balances ---
+  const locs = await call('GET', '/api/locations', { token, device })
+  assert.equal(locs.status, 200)
+  const recvLoc = locs.json.locations.find((l) => l.loc_type === 'RECEIVING')
+  const pickLoc = locs.json.locations.find((l) => l.code === 'A01-01')
+  assert.ok(recvLoc && pickLoc, 'seed phải có vị trí nhận + A01-01')
+
+  const po = await call('POST', '/api/purchase-orders', {
+    token, device,
+    body: { lines: [{ sku: 'GD1-1', description: 'Hàng khói GĐ1', qty_ordered: 10, unit_price: 1000 }] },
+  })
+  assert.equal(po.status, 201, JSON.stringify(po.json))
+  assert.match(po.json.po_no, /^PO-\d{4}$/)
+  const poId = po.json.id
+
+  const poFull0 = await call('GET', `/api/purchase-orders/${poId}`, { token, device })
+  const poLineId = poFull0.json.lines[0].id
+  const early = await call('POST', `/api/purchase-orders/${poId}/receive`, {
+    token, device, body: { lines: [{ po_line_id: poLineId, qty_received: 1 }] },
+  })
+  assert.equal(early.status, 400) // PO còn DRAFT, chưa nhận được
+
+  const sent = await call('POST', `/api/purchase-orders/${poId}/transition`, { token, device, body: { to: 'SENT' } })
+  assert.equal(sent.status, 200)
+
+  // Nhận 8/10 (thiếu 2), trong đó hỏng 1.
+  const rcv = await call('POST', `/api/purchase-orders/${poId}/receive`, {
+    token, device, body: { lines: [{ po_line_id: poLineId, qty_received: 8, qty_damaged: 1, batch_no: 'B1' }] },
+  })
+  assert.equal(rcv.status, 201, JSON.stringify(rcv.json))
+  const receiptId = rcv.json.receipt_id
+
+  const poAfter = await call('GET', `/api/purchase-orders/${poId}`, { token, device })
+  assert.equal(poAfter.json.order.status, 'PARTIAL')
+  const rl = poAfter.json.receipts[0].lines[0]
+  assert.equal(rl.qty_shortage, 2)
+  assert.equal(rl.qty_good, 7)
+  assert.ok(rl.lot_id > 0, 'mỗi dòng nhận sinh 1 lô mới')
+
+  const balOf = async () => (await call('GET', '/api/inventory/balances?sku=GD1-1', { token, device })).json.balances
+  let atRecv = (await balOf()).find((b) => b.location_id === recvLoc.id)
+  assert.deepEqual([atRecv.on_hand, atRecv.inspect, atRecv.available], [8, 8, 0])
+  console.log('✓ GĐ1 nhận hàng: PO PARTIAL, thiếu 2, tồn vào inspect tại vị trí nhận')
+
+  // QC: đạt 7, hỏng 1 (bắt buộc lý do).
+  const qcNoReason = await call('POST', `/api/receipts/${receiptId}/qc`, {
+    token, device, body: { receipt_line_id: rl.id, qty_pass: 7, qty_fail: 1 },
+  })
+  assert.equal(qcNoReason.status, 400)
+  const qc = await call('POST', `/api/receipts/${receiptId}/qc`, {
+    token, device, body: { receipt_line_id: rl.id, qty_pass: 7, qty_fail: 1, reason_code: 'DAMAGED' },
+  })
+  assert.equal(qc.status, 200, JSON.stringify(qc.json))
+  atRecv = (await balOf()).find((b) => b.location_id === recvLoc.id)
+  assert.deepEqual([atRecv.on_hand, atRecv.inspect, atRecv.damaged], [8, 7, 1])
+  console.log('✓ GĐ1 QC: hỏng chuyển inspect -> damaged, thiếu lý do bị chặn')
+
+  // Putaway 7 sang A01-01.
+  const put = await call('POST', `/api/receipts/${receiptId}/putaway`, {
+    token, device, body: { receipt_line_id: rl.id, qty: 7, to_location_id: pickLoc.id },
+  })
+  assert.equal(put.status, 200, JSON.stringify(put.json))
+  const all = await balOf()
+  atRecv = all.find((b) => b.location_id === recvLoc.id)
+  const atPick = all.find((b) => b.location_id === pickLoc.id)
+  assert.deepEqual([atRecv.on_hand, atRecv.inspect, atRecv.damaged], [1, 0, 1])
+  assert.deepEqual([atPick.on_hand, atPick.available], [7, 7])
+
+  const lots = await call('GET', '/api/lots?sku=GD1-1', { token, device })
+  assert.equal(lots.json.lots.length, 1)
+  assert.equal(lots.json.lots[0].status, 'AVAILABLE')
+  assert.equal(lots.json.lots[0].location_id, pickLoc.id)
+  const fedGd1 = await call('GET', '/federation/v1/inventory/availability?sku=GD1-1', { fedKey: 'fed-key-smoke' })
+  assert.equal(fedGd1.json.total_available, 7)
+  console.log('✓ GĐ1 putaway: đích on_hand=7 khả dụng=7, lô AVAILABLE, federation thấy SKU mới')
+
   const backup = await call('POST', '/api/admin/backup', { token })
   assert.equal(backup.status, 200)
   assert.ok(fs.existsSync(path.join(tmp, 'backups', backup.json.file)), 'file backup phải tồn tại')

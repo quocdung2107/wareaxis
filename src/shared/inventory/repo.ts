@@ -102,6 +102,35 @@ export function initSchema() {
       // Liên kho (Federation, GĐ4): peers + nhật ký truy vấn. Không lưu tồn của kho khác.
       { sql: 'CREATE TABLE IF NOT EXISTS federation_peers (id INTEGER PRIMARY KEY AUTOINCREMENT, warehouse_code TEXT UNIQUE, warehouse_name TEXT, base_url TEXT, api_key_hash TEXT, share_policy TEXT, active INTEGER NOT NULL DEFAULT 1, last_seen_at TEXT)' },
       { sql: 'CREATE TABLE IF NOT EXISTS federation_query_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_warehouse_code TEXT, query_type TEXT, sku TEXT, requested_by TEXT, result_status TEXT, created_at TEXT)' },
+      // ===== GĐ1 (kế hoạch v2 Phần 5.3 A/C): danh mục sản phẩm + lô + inbound PO -> nhận -> QC -> putaway =====
+      // RANH GIỚI TỒN: hàng nhận qua PO sống ở lots + stock_balances (ledger) — KHÔNG vào
+      // inventory_rows; tồn hiển thị của hàng nạp file (inventory_rows) không đổi vì GĐ1.
+      { sql: 'CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, sku TEXT UNIQUE NOT NULL, name TEXT, category_id INTEGER, uom TEXT, barcode TEXT, track_lot INTEGER NOT NULL DEFAULT 1, track_expiry INTEGER NOT NULL DEFAULT 0, shelf_life_days INTEGER, active INTEGER NOT NULL DEFAULT 1, created_at TEXT, updated_at TEXT)' },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)' },
+      { sql: `CREATE TABLE IF NOT EXISTS lots (lot_id INTEGER PRIMARY KEY, sku TEXT NOT NULL, product_id INTEGER, batch_no TEXT, lot_no TEXT,
+        manuf_date TEXT, expiry_date TEXT, supplier_id INTEGER, purchase_price REAL, status TEXT NOT NULL DEFAULT 'INSPECT',
+        source_po_id INTEGER, source_receipt_line_id INTEGER, location_id INTEGER, created_at TEXT)` },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_lots_sku ON lots(sku, expiry_date)' },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_lots_status ON lots(status)' },
+      { sql: 'CREATE TABLE IF NOT EXISTS po_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL)' },
+      { sql: 'INSERT OR IGNORE INTO po_counter (id, n) VALUES (1, 0)' },
+      { sql: `CREATE TABLE IF NOT EXISTS purchase_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, po_no TEXT UNIQUE NOT NULL, supplier_id INTEGER,
+        warehouse_id INTEGER, expected_date TEXT, status TEXT NOT NULL DEFAULT 'DRAFT', total_amount REAL NOT NULL DEFAULT 0,
+        note TEXT, created_at TEXT, updated_at TEXT, created_by TEXT)` },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_po_status ON purchase_orders(status)' },
+      { sql: `CREATE TABLE IF NOT EXISTS po_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, po_id INTEGER NOT NULL, product_id INTEGER, sku TEXT NOT NULL,
+        description TEXT, uom TEXT, qty_ordered REAL NOT NULL, qty_received REAL NOT NULL DEFAULT 0, qty_damaged REAL NOT NULL DEFAULT 0,
+        unit_price REAL, expected_batch TEXT, note TEXT)` },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_po_lines_po ON po_lines(po_id)' },
+      { sql: `CREATE TABLE IF NOT EXISTS receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_no TEXT UNIQUE NOT NULL, po_id INTEGER,
+        warehouse_id INTEGER, received_by TEXT, received_at TEXT, status TEXT NOT NULL DEFAULT 'QC_PENDING', created_at TEXT)` },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_receipts_po ON receipts(po_id)' },
+      { sql: `CREATE TABLE IF NOT EXISTS receipt_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_id INTEGER NOT NULL, po_line_id INTEGER,
+        sku TEXT NOT NULL, qty_expected REAL NOT NULL DEFAULT 0, qty_received REAL NOT NULL DEFAULT 0, qty_good REAL NOT NULL DEFAULT 0,
+        qty_damaged REAL NOT NULL DEFAULT 0, qty_shortage REAL NOT NULL DEFAULT 0, qty_more REAL NOT NULL DEFAULT 0,
+        lot_id INTEGER, qc_status TEXT NOT NULL DEFAULT 'PENDING', qty_qc_pass REAL NOT NULL DEFAULT 0, qty_qc_fail REAL NOT NULL DEFAULT 0,
+        qty_putaway REAL NOT NULL DEFAULT 0, damage_reason_code TEXT)` },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_receipt_lines_receipt ON receipt_lines(receipt_id)' },
     ])
     // DB cũ: picks chưa có cột pick_order_id -> thêm (không mất dữ liệu cũ).
     const cols = (await query('PRAGMA table_info(picks)')).map((c) => String(c.name))
@@ -114,6 +143,32 @@ export function initSchema() {
     const editCols = (await query('PRAGMA table_info(inventory_edits)')).map((c) => String(c.name))
     if (!editCols.includes('actor')) {
       await batch([{ sql: 'ALTER TABLE inventory_edits ADD COLUMN actor TEXT' }])
+    }
+    // GĐ1: stock_movements thêm 2 cột cờ inspect (DB cũ chưa có) — ALTER có kiểm tra PRAGMA.
+    const mvCols = (await query('PRAGMA table_info(stock_movements)')).map((c) => String(c.name))
+    const mvAdds: string[] = []
+    if (!mvCols.includes('into_inspect')) mvAdds.push('ALTER TABLE stock_movements ADD COLUMN into_inspect INTEGER NOT NULL DEFAULT 0')
+    if (!mvCols.includes('from_inspect')) mvAdds.push('ALTER TABLE stock_movements ADD COLUMN from_inspect INTEGER NOT NULL DEFAULT 0')
+    if (mvAdds.length) await batch(mvAdds.map((sql) => ({ sql })))
+    // GĐ1: seed kho mặc định + khu + vị trí nhận/cất — CHỈ khi chưa có kho nào.
+    // Đã có dữ liệu (kể cả người dùng sửa) thì không đụng vào.
+    const [{ n: nWh }] = await query('SELECT COUNT(*) AS n FROM warehouses')
+    if (nWh === 0) {
+      const at = nowStamp()
+      await batch([{ sql: 'INSERT INTO warehouses (code, name, is_default, created_at, updated_at, created_by) VALUES (?, ?, 1, ?, ?, ?)', bind: ['MAIN', 'Kho chính', at, at, 'seed'] }])
+      const [{ id: whIdRaw }] = await query('SELECT last_insert_rowid() AS id')
+      const whId = whIdRaw as number
+      await batch([
+        { sql: 'INSERT INTO zones (warehouse_id, code, name, zone_type) VALUES (?, ?, ?, ?)', bind: [whId, 'RECEIVING', 'Khu nhận hàng', 'RECEIVING'] },
+        { sql: 'INSERT INTO zones (warehouse_id, code, name, zone_type) VALUES (?, ?, ?, ?)', bind: [whId, 'STORAGE', 'Khu lưu trữ', 'STORAGE'] },
+      ])
+      const zones = await query('SELECT id, code FROM zones WHERE warehouse_id = ?', [whId])
+      const zId = (code: string) => zones.find((z) => String(z.code) === code)?.id as number
+      await batch([
+        { sql: 'INSERT INTO locations (warehouse_id, zone_id, code, loc_type, pick_sequence) VALUES (?, ?, ?, ?, ?)', bind: [whId, zId('RECEIVING'), 'NHAN-01', 'RECEIVING', 1] },
+        { sql: 'INSERT INTO locations (warehouse_id, zone_id, code, loc_type, pick_sequence) VALUES (?, ?, ?, ?, ?)', bind: [whId, zId('STORAGE'), 'A01-01', 'PICKABLE', 101] },
+        { sql: 'INSERT INTO locations (warehouse_id, zone_id, code, loc_type, pick_sequence) VALUES (?, ?, ?, ?, ?)', bind: [whId, zId('STORAGE'), 'A01-02', 'PICKABLE', 102] },
+      ])
     }
     const [{ n }] = await query('SELECT COUNT(*) AS n FROM uom_map')
     if (n === 0) await batch(Object.entries(DEFAULT_UOM).map(([k, v]) => ({ sql: 'INSERT INTO uom_map VALUES (?, ?)', bind: [k, v] })))

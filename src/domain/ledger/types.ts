@@ -78,6 +78,18 @@ export interface StockMovement extends BalanceKey {
   actor?: string | null
   /** Bắt buộc với REVERSAL: id của movement bị đảo. */
   reverses_movement_id?: number | null
+  /**
+   * GĐ1 (hàng mua qua PO): RECEIVE/RETURN_IN với cờ này vào thẳng xô inspect
+   * (on_hand += qty VÀ inspect += qty) — hàng chờ QC, chưa khả dụng.
+   * Không có cờ: RECEIVE như cũ, vào thẳng khả dụng (nhập tay GĐ0).
+   */
+  into_inspect?: boolean
+  /**
+   * GĐ1: DAMAGE với cờ này lấy phần hỏng TỪ xô inspect (inspect -= qty,
+   * damaged += qty) — hàng hỏng phát hiện khi QC, chưa từng khả dụng.
+   * Không có cờ: DAMAGE như cũ, trừ vào phần khả dụng.
+   */
+  from_inspect?: boolean
   /** Kỳ nạp file (sources.period) tại thời điểm biến động, nếu liên quan. */
   period?: number | null
   created_at?: string | null

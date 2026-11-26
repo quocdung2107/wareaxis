@@ -91,6 +91,26 @@ Mỗi kho chạy server riêng, độc lập. Khi cần tra tồn của kho khá
 - Tắt Internet thì kho vẫn làm việc bình thường (trừ tính năng liên kho
   và các tính năng chia sẻ trên Supabase của app chính).
 
+## API nhập hàng GĐ1 (PO → Nhận → QC → Cất hàng)
+
+Cùng quy trình như trên app, cho điện thoại/tích hợp qua LAN (đều cần đăng nhập +
+thiết bị đã duyệt; quyền ghi trong ngoặc):
+
+| Endpoint | Quyền | Việc |
+|---|---|---|
+| `GET /api/purchase-orders` (`?status=`) | inventory_view | Danh sách PO |
+| `POST /api/purchase-orders` | purchase_create | Tạo PO (body: `lines: [{sku, qty_ordered, unit_price?}]`) |
+| `GET /api/purchase-orders/:id` | inventory_view | PO + dòng + các phiếu nhận |
+| `POST /api/purchase-orders/:id/transition` | purchase_create | Chuyển trạng thái thủ công (`{to: 'SENT' \| 'CANCELLED' \| 'CLOSED'}`) |
+| `POST /api/purchase-orders/:id/receive` | purchase_receive | Nhận hàng: sinh phiếu nhận + lô mới, tồn vào xô chờ QC tại vị trí nhận |
+| `POST /api/receipts/:id/qc` | inventory_receive | QC đạt/hỏng (`{receipt_line_id, qty_pass, qty_fail, reason_code?}` — hỏng bắt buộc lý do) |
+| `POST /api/receipts/:id/putaway` | inventory_putaway | Cất phần đạt lên vị trí đích (`{receipt_line_id, qty, to_location_id}`) |
+| `GET /api/lots` (`?sku=`) | inventory_view | Danh sách lô |
+| `GET /api/locations` | inventory_view | Kho + khu + vị trí |
+
+Lần chạy đầu server tự seed kho chính (MAIN) với vị trí NHAN-01 (nhận hàng),
+A01-01, A01-02 (lấy hàng) nếu chưa có kho nào.
+
 ## Kiểm thử server (cho người kỹ thuật)
 
 ```
@@ -98,7 +118,8 @@ node server/test-smoke.mjs
 ```
 
 Script tự mở server ở cổng test với DB tạm, chạy hết luồng
-đăng nhập → duyệt thiết bị → biến động tồn → liên kho → sao lưu,
+đăng nhập → duyệt thiết bị → biến động tồn → liên kho → GĐ1 (PO → nhận →
+QC → cất hàng → kiểm balances) → sao lưu,
 xong tự dọn. Không nằm trong `npm test` chính vì cần mở cổng mạng.
 
 ## Các biến môi trường

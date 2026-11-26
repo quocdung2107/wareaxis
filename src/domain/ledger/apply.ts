@@ -34,6 +34,8 @@ export function deltaFor(m: StockMovement): Partial<StockBuckets> {
   switch (m.type) {
     case 'RECEIVE':
     case 'RETURN_IN':
+      // GĐ1: hàng PO nhận vào chờ QC -> cộng cả on_hand lẫn inspect (chưa khả dụng).
+      return m.into_inspect ? { on_hand: q, inspect: q } : { on_hand: q }
     case 'ADJUST_IN':
       return { on_hand: q }
     case 'PUTAWAY':
@@ -49,7 +51,8 @@ export function deltaFor(m: StockMovement): Partial<StockBuckets> {
     case 'UNFREEZE':
       return { hold: -q }
     case 'DAMAGE':
-      return { damaged: q }
+      // GĐ1: hỏng phát hiện ở QC lấy từ xô inspect; mặc định trừ vào khả dụng.
+      return m.from_inspect ? { inspect: -q, damaged: q } : { damaged: q }
     case 'TRANSFER_OUT':
       return { on_hand: -q, in_transit: q }
     case 'TRANSFER_IN':
@@ -146,11 +149,18 @@ export function applyReversal(balance: StockBalance, original: StockMovement): S
   switch (original.type) {
     case 'RECEIVE':
     case 'RETURN_IN':
+      if (original.into_inspect) {
+        // Đảo RECEIVE vào inspect: trừ cả on_hand lẫn inspect.
+        return finish(balance, { ...cur, on_hand: cur.on_hand - original.qty, inspect: cur.inspect - original.qty })
+      }
+      return applyMovementToBalance(balance, { ...inverse, type: 'ADJUST_OUT', reason_code: original.reason_code ?? 'INPUT_ERROR' })
     case 'ADJUST_IN':
       return applyMovementToBalance(balance, { ...inverse, type: 'ADJUST_OUT', reason_code: original.reason_code ?? 'INPUT_ERROR' })
     case 'ADJUST_OUT':
       return applyMovementToBalance(balance, { ...inverse, type: 'ADJUST_IN', reason_code: original.reason_code ?? 'INPUT_ERROR' })
     case 'PUTAWAY':
+      // Chỉ đúng cho putaway CÙNG vị trí (inspect -> khả dụng tại chỗ). Putaway
+      // khác vị trí (có from_location_id) muốn đảo phải ghi movement ngược tay.
       return finish(balance, { ...cur, inspect: cur.inspect + original.qty })
     case 'ALLOCATE':
       return applyMovementToBalance(balance, { ...inverse, type: 'DEALLOCATE' })
@@ -161,7 +171,10 @@ export function applyReversal(balance: StockBalance, original: StockMovement): S
     case 'UNFREEZE':
       return applyMovementToBalance(balance, { ...inverse, type: 'FREEZE' })
     case 'DAMAGE':
-      return finish(balance, { ...cur, damaged: cur.damaged - original.qty })
+      // Đảo DAMAGE từ inspect: trả phần hỏng về lại xô inspect.
+      return original.from_inspect
+        ? finish(balance, { ...cur, damaged: cur.damaged - original.qty, inspect: cur.inspect + original.qty })
+        : finish(balance, { ...cur, damaged: cur.damaged - original.qty })
     case 'TRANSFER_OUT':
       return applyMovementToBalance(balance, { ...inverse, type: 'TRANSFER_IN' })
     case 'TRANSFER_IN':
