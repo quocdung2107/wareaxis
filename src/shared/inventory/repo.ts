@@ -102,6 +102,14 @@ export function initSchema() {
       // Liên kho (Federation, GĐ4): peers + nhật ký truy vấn. Không lưu tồn của kho khác.
       { sql: 'CREATE TABLE IF NOT EXISTS federation_peers (id INTEGER PRIMARY KEY AUTOINCREMENT, warehouse_code TEXT UNIQUE, warehouse_name TEXT, base_url TEXT, api_key_hash TEXT, share_policy TEXT, active INTEGER NOT NULL DEFAULT 1, last_seen_at TEXT)' },
       { sql: 'CREATE TABLE IF NOT EXISTS federation_query_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_warehouse_code TEXT, query_type TEXT, sku TEXT, requested_by TEXT, result_status TEXT, created_at TEXT)' },
+      // GĐ4: khoá liên kho cấp cho bên ngoài gọi vào kho này — chỉ lưu SHA-256
+      // hash (key_hash), plaintext chỉ hiển thị đúng 1 lần khi tạo. Mỗi khoá có
+      // chính sách chia sẻ riêng (port từ src/domain/federation/policy.ts).
+      // Warehouse Server có bảng tương đương; standalone dùng bảng này để quản lý.
+      { sql: `CREATE TABLE IF NOT EXISTS federation_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+        key_hash TEXT UNIQUE NOT NULL, share_available INTEGER NOT NULL DEFAULT 1, share_low_stock INTEGER NOT NULL DEFAULT 0,
+        share_cost_price INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT, created_by TEXT, revoked_at TEXT, last_used_at TEXT)` },
       // ===== GĐ1 (kế hoạch v2 Phần 5.3 A/C): danh mục sản phẩm + lô + inbound PO -> nhận -> QC -> putaway =====
       // RANH GIỚI TỒN: hàng nhận qua PO sống ở lots + stock_balances (ledger) — KHÔNG vào
       // inventory_rows; tồn hiển thị của hàng nạp file (inventory_rows) không đổi vì GĐ1.

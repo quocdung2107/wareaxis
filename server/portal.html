@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cổng liên kho — WareAxis</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; background: #f1f5f9; color: #0f172a; }
+  header { background: #1d4ed8; color: #fff; padding: 14px 20px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 4px 0 0; font-size: 13px; opacity: .85; }
+  main { max-width: 1024px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+  section { background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 1px 3px rgb(15 23 42 / .08); }
+  section h2 { margin: 0 0 10px; font-size: 16px; }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  input { width: 100%; min-height: 42px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 10px; font-size: 15px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+  .row > div { flex: 1 1 220px; }
+  button { min-height: 42px; border: 0; border-radius: 8px; padding: 8px 16px; font-size: 15px; font-weight: 600; background: #1d4ed8; color: #fff; cursor: pointer; }
+  button.secondary { background: #fff; color: #1d4ed8; border: 1px solid #1d4ed8; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #475569; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; border-radius: 999px; padding: 1px 9px; font-size: 12px; font-weight: 600; }
+  .fresh { background: #dcfce7; color: #166534; }
+  .stale { background: #fef3c7; color: #92400e; }
+  .off { background: #fee2e2; color: #991b1b; }
+  .on { background: #dcfce7; color: #166534; }
+  .muted { color: #64748b; font-size: 13px; }
+  .error { color: #b91c1c; font-size: 13px; }
+  .total { font-size: 18px; font-weight: 700; }
+  #tokenBox { border: 1px dashed #94a3b8; }
+  @media print {
+    body { background: #fff; }
+    header, #tokenBox, .noprint { display: none !important; }
+    section { box-shadow: none; border: 1px solid #e2e8f0; break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cổng liên kho (Federation Portal)</h1>
+  <p>Tra tồn khả dụng của nhiều kho độc lập — chỉ đọc, không kho nào sửa được tồn của kho khác. Số liệu cũ luôn kèm nhãn thời điểm.</p>
+</header>
+<main>
+  <section id="tokenBox">
+    <h2>Phiên đăng nhập</h2>
+    <div class="row">
+      <div>
+        <label for="token">Token phiên (lấy từ lần đăng nhập vào Warehouse Server)</label>
+        <input id="token" type="password" autocomplete="off" placeholder="Dán token vào đây">
+      </div>
+      <button id="saveToken" type="button">Lưu token</button>
+      <button id="clearToken" type="button" class="secondary">Xoá token</button>
+    </div>
+    <p class="muted" id="tokenState"></p>
+  </section>
+
+  <section>
+    <h2>Tra tồn khả dụng theo SKU</h2>
+    <div class="row">
+      <div>
+        <label for="sku">Mã SKU</label>
+        <input id="sku" type="text" placeholder="Ví dụ: GD1-1" autocomplete="off">
+      </div>
+      <button id="search" type="button">Tra cứu tất cả kho</button>
+      <button id="printBtn" type="button" class="secondary noprint">In kết quả</button>
+    </div>
+    <p id="availMsg" class="muted" role="status"></p>
+    <p id="availTotal" class="total"></p>
+    <div style="overflow-x:auto">
+      <table id="availTable" hidden>
+        <thead><tr><th>Kho</th><th>SKU</th><th>Lô</th><th>Hạn dùng</th><th class="num">Khả dụng</th><th>Độ tươi</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Trạng thái các kho</h2>
+    <div class="row">
+      <button id="refreshStatus" type="button" class="secondary">Làm mới trạng thái</button>
+    </div>
+    <p id="statusMsg" class="muted" role="status"></p>
+    <div style="overflow-x:auto">
+      <table id="statusTable" hidden>
+        <thead><tr><th>Kho</th><th>Mã kho</th><th>Trạng thái</th><th>Lần thấy cuối</th><th>Lỗi gần nhất</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Tồn thấp liên kho</h2>
+    <div class="row">
+      <button id="refreshLow" type="button" class="secondary">Quét tồn thấp</button>
+    </div>
+    <p id="lowMsg" class="muted" role="status"></p>
+    <div style="overflow-x:auto">
+      <table id="lowTable" hidden>
+        <thead><tr><th>Kho</th><th>SKU</th><th class="num">Khả dụng</th><th class="num">Mức tối thiểu</th><th>Ghi chú</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script>
+(function () {
+  var KEY = 'wms-portal-token';
+  var tokenInput = document.getElementById('token');
+  var tokenState = document.getElementById('tokenState');
+  function token() { return sessionStorage.getItem(KEY) || ''; }
+  function syncTokenUi() {
+    tokenState.textContent = token()
+      ? 'Đã có token trong phiên này (chỉ lưu ở sessionStorage của trình duyệt, đóng tab là mất).'
+      : 'Chưa có token — các bảng dưới đây sẽ báo lỗi đăng nhập.';
+    tokenInput.value = token();
+  }
+  document.getElementById('saveToken').addEventListener('click', function () {
+    var v = tokenInput.value.trim();
+    if (v) sessionStorage.setItem(KEY, v); else sessionStorage.removeItem(KEY);
+    syncTokenUi(); loadStatus();
+  });
+  document.getElementById('clearToken').addEventListener('click', function () {
+    sessionStorage.removeItem(KEY); syncTokenUi();
+  });
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function api(path) {
+    return fetch(path, { headers: { Authorization: 'Bearer ' + token() } }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (json) {
+        if (res.status === 401) throw new Error('Phiên đăng nhập không hợp lệ — hãy dán lại token.');
+        if (!res.ok) throw new Error(json.message || ('Lỗi HTTP ' + res.status));
+        return json;
+      });
+    });
+  }
+  function freshness(entry) {
+    if (entry.error && !entry.rows.length) return '<span class="badge off">Không liên lạc được</span>';
+    if (entry.stale) return '<span class="badge stale">Số liệu cũ</span> lúc ' + esc(entry.fetched_at || '—');
+    return '<span class="badge fresh">Mới</span> lúc ' + esc(entry.fetched_at || '—');
+  }
+
+  var availMsg = document.getElementById('availMsg');
+  var availTotal = document.getElementById('availTotal');
+  var availTable = document.getElementById('availTable');
+  function searchAvailability() {
+    var sku = document.getElementById('sku').value.trim();
+    availMsg.textContent = 'Đang tra cứu song song các kho…';
+    availTotal.textContent = ''; availTable.hidden = true;
+    api('/api/portal/availability?sku=' + encodeURIComponent(sku)).then(function (data) {
+      var body = availTable.querySelector('tbody');
+      body.innerHTML = '';
+      (data.results || []).forEach(function (entry) {
+        if (entry.error && !entry.rows.length) {
+          var tr0 = document.createElement('tr');
+          tr0.innerHTML = '<td>' + esc(entry.name) + '</td><td colspan="4" class="error">' + esc(entry.error) + '</td><td>' + freshness(entry) + '</td>';
+          body.appendChild(tr0);
+          return;
+        }
+        (entry.rows || []).forEach(function (r) {
+          var tr = document.createElement('tr');
+          tr.innerHTML = '<td>' + esc(entry.name) + (entry.warehouse_code ? ' (' + esc(entry.warehouse_code) + ')' : '') + '</td>' +
+            '<td>' + esc(r.sku) + '</td><td>' + esc(r.lot_id == null ? '—' : r.lot_id) + '</td>' +
+            '<td>' + esc(r.expiry_date || '—') + '</td><td class="num">' + esc(r.available) + '</td><td>' + freshness(entry) + '</td>';
+          body.appendChild(tr);
+        });
+        if (!entry.rows || !entry.rows.length) {
+          var tr2 = document.createElement('tr');
+          tr2.innerHTML = '<td>' + esc(entry.name) + '</td><td colspan="4" class="muted">Không có tồn của SKU này</td><td>' + freshness(entry) + '</td>';
+          body.appendChild(tr2);
+        }
+      });
+      availTable.hidden = false;
+      availTotal.textContent = 'Tổng khả dụng toàn hệ thống: ' + data.total_available;
+      availMsg.textContent = 'Xong. Dòng "Số liệu cũ" là bản cache gần nhất của kho đang offline — luôn kèm thời điểm, không phải số liệu trực tiếp.';
+      loadStatus();
+    }).catch(function (e) { availMsg.textContent = ''; availTotal.textContent = ''; alert(e.message); });
+  }
+  document.getElementById('search').addEventListener('click', searchAvailability);
+  document.getElementById('sku').addEventListener('keydown', function (e) { if (e.key === 'Enter') searchAvailability(); });
+  document.getElementById('printBtn').addEventListener('click', function () { window.print(); });
+
+  var statusMsg = document.getElementById('statusMsg');
+  var statusTable = document.getElementById('statusTable');
+  function loadStatus() {
+    api('/api/portal/status').then(function (data) {
+      var body = statusTable.querySelector('tbody');
+      body.innerHTML = '';
+      (data.peers || []).forEach(function (p) {
+        var tr = document.createElement('tr');
+        var badge = p.last_status === 'online' ? '<span class="badge on">online</span>'
+          : p.last_status === 'offline' ? '<span class="badge off">offline</span>' : '<span class="badge stale">chưa kiểm tra</span>';
+        if (p.enabled === false) badge = '<span class="badge stale">đã tắt</span>';
+        tr.innerHTML = '<td>' + esc(p.name) + '</td><td>' + esc(p.warehouse_code || '—') + '</td><td>' + badge + '</td>' +
+          '<td>' + esc(p.last_seen_at || '—') + '</td><td class="error">' + esc(p.last_error || '') + '</td>';
+        body.appendChild(tr);
+      });
+      statusTable.hidden = !(data.peers || []).length;
+      statusMsg.textContent = (data.peers || []).length ? '' : 'Chưa cấu hình kho peer nào — thêm peer trong mục Liên kho của app (quyền federation_manage).';
+    }).catch(function (e) { statusMsg.textContent = e.message; });
+  }
+  document.getElementById('refreshStatus').addEventListener('click', loadStatus);
+
+  var lowMsg = document.getElementById('lowMsg');
+  var lowTable = document.getElementById('lowTable');
+  function loadLow() {
+    lowMsg.textContent = 'Đang quét…';
+    api('/api/portal/low-stock').then(function (data) {
+      var body = lowTable.querySelector('tbody');
+      body.innerHTML = '';
+      var any = false;
+      (data.results || []).forEach(function (entry) {
+        if (entry.shared === false) {
+          var tr0 = document.createElement('tr');
+          tr0.innerHTML = '<td>' + esc(entry.name) + '</td><td colspan="3" class="muted">—</td><td class="muted">Kho không chia sẻ tồn thấp</td>';
+          body.appendChild(tr0); any = true; return;
+        }
+        (entry.rows || []).forEach(function (r) {
+          var tr = document.createElement('tr');
+          tr.innerHTML = '<td>' + esc(entry.name) + '</td><td>' + esc(r.sku) + '</td>' +
+            '<td class="num">' + esc(r.available) + '</td><td class="num">' + esc(r.min_qty) + '</td>' +
+            '<td>' + (entry.stale ? '<span class="badge stale">Số liệu cũ</span> lúc ' + esc(entry.fetched_at || '—') : '<span class="badge fresh">Mới</span>') + (entry.error ? ' <span class="error">' + esc(entry.error) + '</span>' : '') + '</td>';
+          body.appendChild(tr); any = true;
+        });
+        if (entry.error && !(entry.rows || []).length) {
+          var tr1 = document.createElement('tr');
+          tr1.innerHTML = '<td>' + esc(entry.name) + '</td><td colspan="4" class="error">' + esc(entry.error) + '</td>';
+          body.appendChild(tr1); any = true;
+        }
+      });
+      lowTable.hidden = !any;
+      lowMsg.textContent = any ? '' : 'Không kho nào có SKU dưới mức tối thiểu.';
+    }).catch(function (e) { lowMsg.textContent = e.message; });
+  }
+  document.getElementById('refreshLow').addEventListener('click', loadLow);
+
+  syncTokenUi();
+  if (token()) loadStatus();
+})();
+</script>
+</body>
+</html>

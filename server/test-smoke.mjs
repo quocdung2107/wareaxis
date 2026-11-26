@@ -24,6 +24,7 @@ const env = {
   WMS_FEDERATION_KEY: 'fed-key-smoke',
 }
 const serverPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'src', 'index.js')
+let childB = null // server B của đoạn GĐ4 (khai báo sớm để finally dọn được)
 const child = spawn(process.execPath, [serverPath], { env, stdio: ['ignore', 'pipe', 'pipe'] })
 child.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`))
 
@@ -449,8 +450,191 @@ try {
   assert.ok(fs.existsSync(path.join(tmp, 'backups', backup.json.file)), 'file backup phải tồn tại')
   console.log('✓ backup tạo file trong data/backups/')
 
+  // --- GĐ4: Federation Portal — spawn server B độc lập (cổng + data riêng),
+  // B cấp khoá qua API, A (portal) thêm peer B, tra tồn chéo kho, chính sách
+  // tồn thấp, rồi kill B để kiểm tra cache stale + trạng thái offline ---
+  const PORT_B = 18788
+  const BASE_B = `http://127.0.0.1:${PORT_B}`
+  const tmpB = fs.mkdtempSync(path.join(os.tmpdir(), 'wms-smoke-b-'))
+  const envB = {
+    ...process.env,
+    WMS_PORT: String(PORT_B),
+    WMS_DATA_DIR: tmpB,
+    WMS_DB_PATH: path.join(tmpB, 'warehouse.db'),
+    WMS_ADMIN_USER: 'admin',
+    WMS_ADMIN_PASS: 'smoke-b-pass',
+    WMS_WAREHOUSE_CODE: 'KHO-B',
+  }
+  delete envB.WMS_FEDERATION_KEY // B chỉ dùng khoá cấp qua API, không dùng khoá env
+  childB = spawn(process.execPath, [serverPath], { env: envB, stdio: ['ignore', 'pipe', 'pipe'] })
+  childB.stderr.on('data', (d) => process.stderr.write(`[serverB] ${d}`))
+  const callB = async (method, p, { token: t, device: dv, fedKey, body } = {}) => {
+    const headers = { 'Content-Type': 'application/json' }
+    if (t) headers.Authorization = `Bearer ${t}`
+    if (dv) { headers['x-device-id'] = String(dv.id); headers['x-device-token'] = dv.token }
+    if (fedKey) headers['x-federation-key'] = fedKey
+    const res = await fetch(BASE_B + p, { method, headers, body: body ? JSON.stringify(body) : undefined })
+    return { status: res.status, json: await res.json().catch(() => ({})) }
+  }
+  try {
+    let upB = false
+    for (let i = 0; i < 50 && !upB; i++) {
+      try { const r = await callB('GET', '/api/health'); upB = r.status === 200 && r.json.ok === true } catch { await new Promise((r) => setTimeout(r, 100)) }
+    }
+    assert.ok(upB, 'server B không lên được')
+
+    const loginB = await callB('POST', '/api/auth/login', { body: { username: 'admin', password: 'smoke-b-pass' } })
+    assert.equal(loginB.status, 200)
+    const tokenB = loginB.json.token
+    const regB = await callB('POST', '/api/devices/register', { token: tokenB, body: { device_name: 'Máy B' } })
+    const deviceB = { id: regB.json.id, token: regB.json.device_token }
+    assert.equal((await callB('POST', `/api/devices/${deviceB.id}/approve`, { token: tokenB })).status, 200)
+
+    // (a1) B tạo khoá federation qua API — plaintext chỉ trả 1 lần, server lưu hash.
+    const keyRes = await callB('POST', '/api/federation/keys', {
+      token: tokenB, body: { name: 'Portal A', share_available: true },
+    })
+    assert.equal(keyRes.status, 201, JSON.stringify(keyRes.json))
+    assert.match(keyRes.json.key, /^fed_[0-9a-f]{48}$/)
+    const fedKeyB = keyRes.json.key
+    const keyIdB = keyRes.json.id
+    const keyList = await callB('GET', '/api/federation/keys', { token: tokenB })
+    assert.equal(keyList.json.keys.length, 1)
+    assert.ok(!JSON.stringify(keyList.json).includes(fedKeyB), 'danh sách khoá không được lộ plaintext/hash dùng để gọi')
+    console.log('✓ GĐ4 B tạo khoá federation qua API (trả plaintext 1 lần)')
+
+    // (a2) B nhận SKU FED-1 qua luồng GĐ1 tối thiểu: PO -> SENT -> nhận 20 -> QC -> putaway.
+    const locsB = await callB('GET', '/api/locations', { token: tokenB, device: deviceB })
+    const pickLocB = locsB.json.locations.find((l) => l.code === 'A01-01')
+    assert.ok(pickLocB)
+    const poB = await callB('POST', '/api/purchase-orders', {
+      token: tokenB, device: deviceB,
+      body: { lines: [{ sku: 'FED-1', description: 'Hàng liên kho', qty_ordered: 20, unit_price: 7000 }] },
+    })
+    assert.equal(poB.status, 201, JSON.stringify(poB.json))
+    await callB('POST', `/api/purchase-orders/${poB.json.id}/transition`, { token: tokenB, device: deviceB, body: { to: 'SENT' } })
+    const poBFull0 = await callB('GET', `/api/purchase-orders/${poB.json.id}`, { token: tokenB, device: deviceB })
+    const rcvB = await callB('POST', `/api/purchase-orders/${poB.json.id}/receive`, {
+      token: tokenB, device: deviceB,
+      body: { lines: [{ po_line_id: poBFull0.json.lines[0].id, qty_received: 20 }] },
+    })
+    assert.equal(rcvB.status, 201, JSON.stringify(rcvB.json))
+    const poBFull = await callB('GET', `/api/purchase-orders/${poB.json.id}`, { token: tokenB, device: deviceB })
+    const rlB = poBFull.json.receipts[0].lines[0]
+    assert.equal((await callB('POST', `/api/receipts/${rcvB.json.receipt_id}/qc`, {
+      token: tokenB, device: deviceB, body: { receipt_line_id: rlB.id, qty_pass: 20, qty_fail: 0 },
+    })).status, 200)
+    assert.equal((await callB('POST', `/api/receipts/${rcvB.json.receipt_id}/putaway`, {
+      token: tokenB, device: deviceB, body: { receipt_line_id: rlB.id, qty: 20, to_location_id: pickLocB.id },
+    })).status, 200)
+    console.log('✓ GĐ4 B nhận FED-1: available = 20 tại kho B')
+
+    // (d-sớm) Khoá sai -> 403; khoá đúng -> 200, KHÔNG lộ giá vốn (policy mặc định).
+    const fedWrong = await callB('GET', '/federation/v1/inventory/availability?sku=FED-1', { fedKey: 'sai-khoa' })
+    assert.equal(fedWrong.status, 403)
+    const fedOk = await callB('GET', '/federation/v1/inventory/availability?sku=FED-1', { fedKey: fedKeyB })
+    assert.equal(fedOk.status, 200)
+    assert.equal(fedOk.json.total_available, 20)
+    assert.equal(fedOk.json.rows.length, 1)
+    assert.ok(!('purchase_price' in fedOk.json.rows[0]), 'mặc định không chia sẻ giá vốn')
+    const infoB = await callB('GET', '/federation/info', { fedKey: fedKeyB })
+    assert.equal(infoB.json.warehouse_code, 'KHO-B')
+    assert.ok(infoB.json.warehouse_name)
+    // Nhật ký truy vấn trên B ghi cả lần thành công lẫn lần bị chặn.
+    const qlog = await callB('GET', '/api/federation/query-log', { token: tokenB })
+    assert.ok(qlog.json.logs.some((l) => l.query_type === 'availability' && l.result_status === 'ok' && l.key_id === keyIdB && l.result_count === 1))
+    assert.ok(qlog.json.logs.some((l) => l.result_status === 'forbidden'))
+    console.log('✓ GĐ4 federation trên B: sai khoá 403, đúng khoá 200 không lộ giá, query log đủ')
+
+    // Tồn thấp: khoá chưa bật share_low_stock -> 403 rõ ràng.
+    const lowDeny = await callB('GET', '/federation/low-stock', { fedKey: fedKeyB })
+    assert.equal(lowDeny.status, 403)
+    assert.equal(lowDeny.json.error, 'share_low_stock_disabled')
+
+    // (b) A thêm peer B + peer khoá sai; test ping/info.
+    const peerB = await call('POST', '/api/portal/peers', {
+      token, body: { name: 'Kho B khói', base_url: BASE_B, api_key: fedKeyB },
+    })
+    assert.equal(peerB.status, 201, JSON.stringify(peerB.json))
+    const testB = await call('POST', `/api/portal/peers/${peerB.json.id}/test`, { token })
+    assert.equal(testB.json.ok, true, JSON.stringify(testB.json))
+    assert.equal(testB.json.warehouse_code, 'KHO-B')
+    const peerBad = await call('POST', '/api/portal/peers', {
+      token, body: { name: 'Kho khoá sai', base_url: BASE_B, api_key: 'fed_sai' },
+    })
+    assert.equal(peerBad.status, 201)
+    const testBad = await call('POST', `/api/portal/peers/${peerBad.json.id}/test`, { token })
+    assert.equal(testBad.json.ok, false)
+    console.log('✓ GĐ4 portal: thêm peer B test OK (KHO-B), peer khoá sai test fail')
+
+    // Portal tra FED-1: thấy B đủ 20, stale=false; peer khoá sai báo lỗi, rows rỗng.
+    const portalAvail = await call('GET', '/api/portal/availability?sku=FED-1', { token })
+    assert.equal(portalAvail.status, 200, JSON.stringify(portalAvail.json))
+    const entryB = portalAvail.json.results.find((r) => r.peer_id === peerB.json.id)
+    assert.ok(entryB, 'portal phải có kết quả của peer B')
+    assert.equal(entryB.stale, false)
+    assert.equal(entryB.total_available, 20)
+    assert.equal(entryB.rows[0].available, 20)
+    const entryBad = portalAvail.json.results.find((r) => r.peer_id === peerBad.json.id)
+    assert.ok(entryBad && entryBad.error && entryBad.rows.length === 0, 'peer khoá sai phải báo lỗi riêng')
+    assert.equal(portalAvail.json.total_available, 20)
+    const fetchedAtB = entryB.fetched_at
+    assert.ok(fetchedAtB)
+    console.log('✓ GĐ4 portal availability: B = 20 (mới), tổng hệ thống = 20, peer sai khoá báo lỗi')
+
+    // Tồn thấp liên kho: B chưa bật chia sẻ -> portal ghi chú "không chia sẻ".
+    const portalLow1 = await call('GET', '/api/portal/low-stock', { token })
+    const lowB1 = portalLow1.json.results.find((r) => r.peer_id === peerB.json.id)
+    assert.equal(lowB1.shared, false)
+    assert.match(lowB1.note, /không chia sẻ/)
+    // Bật policy trên B + đặt policy tồn (min 50 > available 20) -> portal thấy dòng.
+    const polFed = await callB('PUT', `/api/federation/keys/${keyIdB}/policy`, {
+      token: tokenB, body: { share_available: true, share_low_stock: true, share_cost_price: false },
+    })
+    assert.equal(polFed.status, 200, JSON.stringify(polFed.json))
+    const whB = pickLocB.warehouse_id
+    const polB = await callB('PUT', '/api/stock-policies', {
+      token: tokenB, device: deviceB, body: { sku: 'FED-1', warehouse_id: whB, min_qty: 50, max_qty: 100 },
+    })
+    assert.equal(polB.status, 201, JSON.stringify(polB.json))
+    const portalLow2 = await call('GET', '/api/portal/low-stock', { token })
+    const lowB2 = portalLow2.json.results.find((r) => r.peer_id === peerB.json.id)
+    assert.equal(lowB2.shared, true)
+    const lowRow = lowB2.rows.find((r) => r.sku === 'FED-1')
+    assert.ok(lowRow, 'portal phải thấy FED-1 tồn thấp ở B')
+    assert.deepEqual([lowRow.available, lowRow.min_qty], [20, 50])
+    console.log('✓ GĐ4 portal low-stock: chưa bật -> ghi chú không chia sẻ; bật -> thấy FED-1 (20 < min 50)')
+
+    // Trang portal tĩnh phục vụ được.
+    const portalPage = await fetch(`${BASE}/portal`)
+    assert.equal(portalPage.status, 200)
+    assert.match(await portalPage.text(), /Cổng liên kho/)
+    console.log('✓ GĐ4 trang /portal phục vụ HTML tĩnh')
+
+    // (c) Kill B -> portal dùng cache: stale=true + fetched_at cũ; status offline.
+    childB.kill('SIGTERM')
+    childB = null
+    await new Promise((r) => setTimeout(r, 400))
+    const portalStale = await call('GET', '/api/portal/availability?sku=FED-1', { token })
+    const staleB = portalStale.json.results.find((r) => r.peer_id === peerB.json.id)
+    assert.ok(staleB, 'vẫn phải có dòng của B từ cache')
+    assert.equal(staleB.stale, true)
+    assert.equal(staleB.fetched_at, fetchedAtB)
+    assert.equal(staleB.total_available, 20)
+    const statusRes = await call('GET', '/api/portal/status', { token })
+    const stB = statusRes.json.peers.find((x) => x.id === peerB.json.id)
+    assert.equal(stB.last_status, 'offline')
+    assert.ok(stB.last_error)
+    console.log('✓ GĐ4 B offline: portal trả cache stale=true kèm fetched_at cũ, status offline')
+  } finally {
+    if (childB) childB.kill('SIGTERM')
+    childB = null
+    fs.rmSync(tmpB, { recursive: true, force: true })
+  }
+
   console.log('\nSMOKE TEST PASS')
 } finally {
+  if (childB) childB.kill('SIGTERM')
   child.kill('SIGTERM')
   fs.rmSync(tmp, { recursive: true, force: true })
 }

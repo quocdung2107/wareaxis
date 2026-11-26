@@ -30,9 +30,10 @@ const TOOLS: { group: string; path: string; title: string; hint: string; icon: I
   { group: 'Dữ liệu', path: 'kho-vi-tri', title: 'Kho & vị trí', hint: 'Kho, khu, vị trí lưu trữ: loại vị trí, thứ tự lấy hàng', icon: 'box', page: lazy(() => import('../features/locations/LocationsPage.tsx')) },
   { group: 'Dữ liệu', path: 'khach-hang', title: 'Khách hàng', hint: 'Danh sách khách: mã, địa chỉ giao, Sup, SĐT', icon: 'users', page: lazy(() => import('../features/customers/CustomersPage.tsx')) },
   { group: 'Dữ liệu', path: 'dvt', title: 'Đơn vị tính', hint: 'Gom CAI / CÁI / Cái về một tên', icon: 'scale', page: lazy(() => import('../features/settings/UomPage.tsx')) },
+  { group: 'Hệ thống', path: 'federation', title: 'Liên kho', hint: 'Khoá liên kho + chính sách chia sẻ + cổng tra tồn của nhiều kho (chỉ đọc, qua VPN)', icon: 'users', page: lazy(() => import('../features/federation/FederationPage.tsx')) },
 ]
 
-const GROUPS = ['Dữ liệu', 'Kiểm đếm', 'Lấy hàng', 'In ấn & file']
+const GROUPS = ['Dữ liệu', 'Kiểm đếm', 'Lấy hàng', 'In ấn & file', 'Hệ thống']
 
 const routeOf = () => location.hash.replace(/^#\/?/, '')
 

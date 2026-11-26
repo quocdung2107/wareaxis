@@ -73,14 +73,58 @@ Vì dữ liệu không lên cloud, **phải sao lưu đều**:
 
 ## Liên kho (Federation) — khi có nhiều kho/đại lý
 
-Mỗi kho chạy server riêng, độc lập. Khi cần tra tồn của kho khác:
+Mỗi kho chạy server riêng, độc lập. Liên kho chỉ **đọc ở mức truy vấn** —
+không có CSDL tồn trung tâm, không kho nào sửa được tồn của kho khác.
 
-- Đặt khoá liên kho giống nhau ở các kho cần tra nhau:
-  `set WMS_FEDERATION_KEY=khoa-bi-mat-dai-va-kho-doan`
-- Kho khác tra qua `GET /federation/v1/inventory/availability?sku=...`
-  kèm header `x-federation-key`. Chỉ xem được **số lượng tồn khả dụng** —
-  không xem được giá vốn, nhà cung cấp, lịch sử biến động.
-- Chưa đặt khoá thì API trả `503 federation_not_configured` (tắt hẳn).
+**Khoá liên kho (GĐ4 — cấp theo từng phía):**
+
+- Cách chính: người có quyền `federation_manage` tạo khoá qua API
+  `POST /api/federation/keys` (hoặc mục Liên kho trong app). Server trả
+  khoá plaintext **đúng 1 lần** và chỉ lưu **băm SHA-256** — cấp khoá đó
+  cho phía portal/kho kia để họ gọi vào. Mỗi khoá có chính sách riêng:
+  `share_available` (tồn khả dụng), `share_low_stock` (tồn thấp),
+  `share_cost_price` (giá vốn — **mặc định tắt**, chỉ bật khi thật cần).
+  Thu hồi: `POST /api/federation/keys/:id/revoke`; sửa chính sách:
+  `PUT /api/federation/keys/:id/policy`.
+- Cách cũ vẫn chạy: đặt `WMS_FEDERATION_KEY=khoa-bi-mat-dai-va-kho-doan`
+  thì khoá đó hoạt động như "khoá hệ thống" với chính sách mặc định
+  (chỉ availability, không giá vốn, không tồn thấp).
+- Chưa có khoá nào thì API trả `503 federation_not_configured` (tắt hẳn).
+- Mọi truy vấn (kể cả bị chặn) đều ghi `federation_query_logs`: xem qua
+  `GET /api/federation/query-log` (100 dòng mới nhất).
+
+**API chỉ-đọc cho kho khác/portal** (header `x-federation-key`):
+
+- `GET /federation/v1/ping` — kiểm tra sống (không cần khoá).
+- `GET /federation/info` — mã kho, tên kho, giờ server, phiên bản.
+- `GET /federation/v1/inventory/availability?sku=...` — tồn khả dụng:
+  `rows` chuẩn hoá theo SKU/lô kèm hạn dùng (giá vốn chỉ có khi khoá bật
+  `share_cost_price`) + `balances` chi tiết theo vị trí (tương thích cũ).
+- `GET /federation/low-stock` — SKU dưới mức tối thiểu; khoá chưa bật
+  `share_low_stock` thì trả `403 share_low_stock_disabled`.
+
+**Cổng liên kho (Portal) — chạy ngay trong server này:**
+
+1. Chọn 1 máy chạy portal (máy văn phòng hoặc máy trung tâm của 1 kho).
+2. Thêm từng kho peer qua API (quyền `federation_manage`):
+   `POST /api/portal/peers` với `{name, base_url, api_key}` — `base_url`
+   là địa chỉ của kho đích **trong VPN** (ví dụ `http://100.64.0.2:8787`
+   của Tailscale), `api_key` là khoá kho đích đã cấp cho portal này.
+   Kiểm tra kết nối: `POST /api/portal/peers/:id/test`.
+3. Mở trang portal: `http://<địa chỉ máy portal>:8787/portal` — dán token
+   phiên đăng nhập 1 lần (trang lưu ở sessionStorage), tra SKU để xem tồn
+   mọi kho + tổng toàn hệ thống, trạng thái online/offline và tồn thấp.
+   Portal gọi từng kho với timeout 3 giây; kho không liên lạc được thì
+   portal hiển thị **bản cache gần nhất kèm nhãn "số liệu cũ" và thời
+   điểm** — cache chỉ để hiển thị minh bạch, không phải dữ liệu trung tâm.
+4. API của portal: `GET /api/portal/availability?sku=`,
+   `GET /api/portal/status`, `GET /api/portal/low-stock` (phiên đăng nhập
+   thường + quyền `inventory_view`).
+
+> **Bảo vệ file dữ liệu:** portal cần lưu khoá của các kho đích trong
+> `server/data/warehouse.db` để gọi đi — hãy coi thư mục `server/data/`
+> như mật khẩu: chỉ tài khoản máy đó đọc được, sao lưu có kiểm soát,
+> không chia sẻ file DB ra ngoài.
 
 ## CẢNH BÁO AN TOÀN
 
@@ -167,6 +211,25 @@ lý do khi thuộc nhóm bắt buộc.
 | `GET /api/alerts` (`?status=`) | inventory_view | Danh sách cảnh báo |
 | `POST /api/alerts/:id/ack` | inventory_adjust | Xác nhận đã biết |
 
+## API liên kho GĐ4 (Federation + Portal)
+
+| Endpoint | Quyền / khoá | Mô tả |
+|---|---|---|
+| `GET /federation/v1/ping` | công khai | Kiểm tra server sống: mã kho, tên kho, giờ, phiên bản |
+| `GET /federation/info` | khoá federation | Mã kho + tên kho + giờ server + phiên bản |
+| `GET /federation/v1/inventory/availability?sku=` | khoá federation (`share_available`) | Tồn khả dụng chuẩn hoá theo SKU/lô + HSD; giá vốn chỉ khi khoá bật `share_cost_price` |
+| `GET /federation/low-stock` | khoá federation (`share_low_stock`) | SKU dưới mức tối thiểu; chưa bật chia sẻ trả 403 |
+| `GET /api/federation/keys` / `POST /api/federation/keys` | federation_manage | Danh sách khoá (không lộ khoá) / tạo khoá — plaintext trả đúng 1 lần, server chỉ lưu băm SHA-256 |
+| `POST /api/federation/keys/:id/revoke` | federation_manage | Thu hồi khoá |
+| `GET/PUT /api/federation/keys/:id/policy` | federation_manage | Xem / sửa 3 công tắc chia sẻ của khoá |
+| `GET /api/federation/query-log` | federation_manage | 100 truy vấn liên kho mới nhất (kể cả lần bị chặn) |
+| `GET/POST /api/portal/peers`, `PUT/DELETE /api/portal/peers/:id` | federation_manage | Quản lý danh sách kho peer của cổng |
+| `POST /api/portal/peers/:id/test` | federation_manage | Ping + info tới kho peer, cập nhật trạng thái |
+| `GET /api/portal/availability?sku=` | inventory_view | Tra tồn song song mọi kho + tổng; kho offline trả cache kèm `stale: true` + `fetched_at` |
+| `GET /api/portal/status` | inventory_view | Trạng thái online/offline + lần thấy cuối của từng kho |
+| `GET /api/portal/low-stock` | inventory_view | Tồn thấp tổng hợp; kho không chia sẻ có ghi chú riêng |
+| `GET /portal` | trang tĩnh | Trang cổng liên kho (HTML thuần, tự nhập token phiên) |
+
 ## Kiểm thử server (cho người kỹ thuật)
 
 ```
@@ -179,7 +242,10 @@ QC → cất hàng → kiểm balances) → GĐ2 (đơn xuất → phân bổ �
 đóng gói → giao → trả hàng về lô gốc → QC → cất lại) → GĐ3 (đóng băng →
 phân bổ bị chặn một phần → chuyển vị trí → kiểm kê quay vòng đếm thiếu →
 duyệt áp chênh lệch → chuyển kho 2 bước → gợi ý đặt hàng → PO nháp →
-cảnh báo hết hạn/tồn thấp) → sao lưu,
+cảnh báo hết hạn/tồn thấp) → sao lưu → GĐ4 (tự mở thêm server B độc lập:
+B cấp khoá qua API → B nhận hàng → portal ở server chính thêm peer B →
+tra tồn chéo kho → chính sách tồn thấp → kill B kiểm tra cache "số liệu
+cũ" + trạng thái offline),
 xong tự dọn. Không nằm trong `npm test` chính vì cần mở cổng mạng.
 
 ## Các biến môi trường
@@ -189,6 +255,6 @@ xong tự dọn. Không nằm trong `npm test` chính vì cần mở cổng mạ
 | `WMS_PORT` | `8787` | Cổng server |
 | `WMS_WAREHOUSE_CODE` | `KHO-01` | Mã kho này (hiện trong federation/health) |
 | `WMS_ADMIN_USER` / `WMS_ADMIN_PASS` | `admin` / `doi-mat-khau-ngay` | Tài khoản quản trị tạo ở lần chạy đầu |
-| `WMS_FEDERATION_KEY` | (trống = tắt) | Khoá cho API liên kho chỉ-đọc |
+| `WMS_FEDERATION_KEY` | (trống) | Khoá hệ thống cho API liên kho chỉ-đọc (cách cũ; cách chính là cấp khoá qua API/mục Liên kho) |
 | `WMS_DATA_DIR` | `server/data` | Thư mục chứa DB + backups |
 | `WMS_DB_PATH` | `server/data/warehouse.db` | Đường dẫn file DB (chủ yếu cho test) |

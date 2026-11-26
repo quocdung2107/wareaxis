@@ -97,6 +97,34 @@ unfreeze|move`, `GET /api/inventory/frozen`, `GET/POST /api/transfer-orders`
 /api/replenishment/suggestions`, `POST /api/replenishment/create-pos`,
 `POST /api/alerts/scan`, `GET /api/alerts`, `POST /api/alerts/:id/ack`.
 
+## GĐ4 — Liên kho (Federation Portal: cổng tra tồn của nhiều kho)
+
+Mỗi kho vẫn tự quản lý độc lập; liên kho chỉ **đọc ở mức truy vấn** — không có
+cơ sở dữ liệu tồn trung tâm, không kho nào sửa được tồn của kho khác.
+
+- **Khoá theo từng phía được cấp:** mục **Liên kho** trong app (nhóm Hệ thống)
+  tạo khoá cho từng portal/kho đối tác — khoá plaintext chỉ hiển thị đúng 1
+  lần, hệ thống chỉ lưu băm SHA-256. Mỗi khoá có 3 công tắc chia sẻ: tồn khả
+  dụng, tồn thấp, và giá vốn (**mặc định tắt**; giá chỉ đi kèm khi bật riêng
+  cho đúng khoá đó). Thu hồi từng khoá độc lập. Khoá hệ thống cũ qua biến
+  `WMS_FEDERATION_KEY` vẫn dùng được với chính sách mặc định. Mọi truy vấn
+  đều ghi nhật ký (ai hỏi, SKU gì, kết quả) xem ngay trong mục Liên kho.
+- **API chỉ-đọc của mỗi kho:** `GET /federation/info`,
+  `GET /federation/v1/inventory/availability?sku=` (dòng chuẩn hoá theo
+  SKU/lô kèm hạn dùng), `GET /federation/low-stock` (chỉ khi khoá bật chia
+  sẻ tồn thấp, chưa bật trả 403 rõ ràng) — đều kèm header `x-federation-key`.
+- **Cổng liên kho (Portal)** chạy ngay trong Warehouse Server tại
+  `http://<máy chủ>:8787/portal`: cấu hình danh sách kho peer (địa chỉ +
+  khoá), tra một SKU thấy tồn của mọi kho và tổng toàn hệ thống; kho nào
+  offline thì cổng hiển thị **số liệu gần nhất kèm nhãn "số liệu cũ" + thời
+  điểm**, không giả vờ là số trực tiếp. Có thêm bảng trạng thái các kho và
+  mục tồn thấp liên kho (kho không chia sẻ được ghi chú rõ). Trang portal là
+  HTML tĩnh, in được; đăng nhập bằng token phiên của server.
+- Các kho nối nhau qua **VPN riêng (Tailscale/WireGuard)** — tuyệt đối không
+  mở cổng server ra Internet. Điều chuyển hàng thật giữa các kho vẫn làm
+  bằng phiếu chuyển kho của GĐ3 tại từng kho; portal chỉ gợi ý, không tự
+  sửa tồn. Chi tiết vận hành: `server/README.md`.
+
 ## Triển khai lên GitHub Pages
 
 Địa chỉ app: `https://quocdung2107.github.io/wms/`

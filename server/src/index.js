@@ -125,6 +125,32 @@ CREATE TABLE IF NOT EXISTS transfer_lines (id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, alert_key TEXT UNIQUE NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL DEFAULT 'INFO', sku TEXT, lot_id INTEGER, location_id INTEGER, message TEXT, status TEXT NOT NULL DEFAULT 'NEW', created_at TEXT, updated_at TEXT, ack_by TEXT, ack_at TEXT, resolved_at TEXT);
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status, severity);
 `)
+
+// Schema GĐ4 (Federation Portal — kế hoạch v2 Phần 4B.4):
+// - federation_keys: khoá liên kho CẤP CHO bên ngoài gọi vào kho này. Chỉ lưu
+//   SHA-256 hash của khoá (cột key_hash) — plaintext chỉ tồn tại ở phía bên
+//   gọi (portal/kho khác) và được trả đúng 1 lần khi tạo. Mỗi khoá có chính
+//   sách chia sẻ riêng (3 công tắc, port từ src/domain/federation/policy.ts).
+//   Khoá env WMS_FEDERATION_KEY cũ vẫn được chấp nhận như "khoá hệ thống"
+//   với chính sách mặc định (chỉ availability, không giá vốn, không low-stock).
+// - portal_peers / portal_cache: cổng liên kho chạy ngay trong server này.
+//   portal_peers.api_key là khoá của KHO ĐÍCH mà portal cần để gọi đi — bắt
+//   buộc phải lưu dạng dùng lại được trong file DB local của máy portal.
+//   HỆ QUẢ: file data/warehouse.db phải được bảo vệ như mật khẩu (xem README).
+//   portal_cache CHỈ là bản sao kết quả truy vấn gần nhất kèm fetched_at để
+//   hiển thị minh bạch khi kho đích offline — không phải CSDL tồn trung tâm.
+db.exec(`
+CREATE TABLE IF NOT EXISTS federation_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, key_hash TEXT UNIQUE NOT NULL, share_available INTEGER NOT NULL DEFAULT 1, share_low_stock INTEGER NOT NULL DEFAULT 0, share_cost_price INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT, created_by TEXT, revoked_at TEXT, last_used_at TEXT);
+CREATE TABLE IF NOT EXISTS portal_peers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT, warehouse_code TEXT, enabled INTEGER NOT NULL DEFAULT 1, last_status TEXT, last_seen_at TEXT, last_error TEXT, created_at TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS portal_cache (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_id INTEGER NOT NULL, kind TEXT NOT NULL, sku TEXT, payload_json TEXT, fetched_at TEXT, UNIQUE (peer_id, kind, sku));
+CREATE INDEX IF NOT EXISTS idx_portal_cache_peer ON portal_cache(peer_id, kind);
+`)
+{
+  // federation_query_logs: thêm key_id + result_count (DB cũ chưa có).
+  const fedLogCols = db.prepare('PRAGMA table_info(federation_query_logs)').all().map((c) => c.name)
+  if (!fedLogCols.includes('key_id')) db.exec('ALTER TABLE federation_query_logs ADD COLUMN key_id INTEGER')
+  if (!fedLogCols.includes('result_count')) db.exec('ALTER TABLE federation_query_logs ADD COLUMN result_count INTEGER')
+}
 {
   const cols = db.prepare('PRAGMA table_info(stock_movements)').all().map((c) => c.name)
   if (!cols.includes('into_inspect')) db.exec('ALTER TABLE stock_movements ADD COLUMN into_inspect INTEGER NOT NULL DEFAULT 0')
@@ -705,6 +731,159 @@ function scanAlertsS(today) {
   return out.sort((a, b) => rank[a.severity] - rank[b.severity] || a.alert_key.localeCompare(b.alert_key))
 }
 
+// ---------- Federation GĐ4 (port từ src/domain/federation/policy.ts) ----------
+// Áp chính sách chia sẻ: tắt available -> rỗng; bóc trường giá vốn trừ khi
+// share_cost_price bật cho đúng khoá gọi vào.
+const FED_COST_FIELDS = ['unit_cost', 'cost_price', 'purchase_price']
+function applySharePolicyS(rows, policy) {
+  if (!policy.share_available) return []
+  return rows.map((r) => {
+    const out = {
+      sku: String(r.sku),
+      lot_id: r.lot_id ?? null,
+      expiry_date: r.expiry_date ?? null,
+      available: Number(r.available) || 0,
+    }
+    if (policy.share_cost_price) {
+      for (const f of FED_COST_FIELDS) {
+        const v = r[f]
+        if (v != null && Number.isFinite(Number(v))) out[f] = Number(v)
+      }
+    }
+    return out
+  })
+}
+function validatePeerConfigS(input) {
+  const errors = []
+  if (!String(input.name ?? '').trim()) errors.push('Tên kho peer không được để trống')
+  const raw = String(input.base_url ?? '').trim()
+  if (!raw) errors.push('Địa chỉ (base_url) của kho peer không được để trống')
+  else {
+    let u = null
+    try { u = new URL(raw) } catch { u = null }
+    if (!u) errors.push('Địa chỉ (base_url) không phải URL hợp lệ')
+    else if (u.protocol !== 'http:' && u.protocol !== 'https:') errors.push('Địa chỉ (base_url) phải bắt đầu bằng http:// hoặc https://')
+  }
+  if (!String(input.api_key ?? '').trim()) errors.push('Thiếu khoá liên kho (api_key) của kho peer')
+  return errors
+}
+const normalizeBaseUrlS = (raw) => String(raw ?? '').trim().replace(/\/+$/, '')
+
+/**
+ * Xác thực khoá federation từ header x-federation-key. Trả:
+ * - { key: {id, name, share_available, share_low_stock, share_cost_price} } khi đúng khoá
+ *   (khoá DB theo key_hash, hoặc khoá env WMS_FEDERATION_KEY như khoá hệ thống);
+ * - { error: 'not_configured' } khi kho chưa có bất kỳ khoá nào;
+ * - { error: 'forbidden' } khi khoá sai/thiếu/đã thu hồi.
+ * So khớp bằng hash + timingSafeEqual, không so plaintext.
+ */
+function checkFederationKey(req) {
+  const given = String(req.headers['x-federation-key'] || '')
+  const givenHash = sha256(given)
+  const row = given
+    ? db.prepare('SELECT * FROM federation_keys WHERE key_hash = ? AND active = 1').get(givenHash)
+    : null
+  if (row) {
+    const a = Buffer.from(givenHash, 'hex')
+    const b = Buffer.from(String(row.key_hash), 'hex')
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      db.prepare('UPDATE federation_keys SET last_used_at = ? WHERE id = ?').run(nowStamp(), row.id)
+      return {
+        key: {
+          id: row.id, name: row.name,
+          share_available: !!row.share_available, share_low_stock: !!row.share_low_stock,
+          share_cost_price: !!row.share_cost_price,
+        },
+      }
+    }
+  }
+  if (FEDERATION_KEY) {
+    if (given) {
+      const g = Buffer.from(given)
+      const e = Buffer.from(FEDERATION_KEY)
+      if (g.length === e.length && crypto.timingSafeEqual(g, e)) {
+        return { key: { id: null, name: 'env:WMS_FEDERATION_KEY', share_available: true, share_low_stock: false, share_cost_price: false } }
+      }
+    }
+    return { error: 'forbidden' }
+  }
+  const { n } = db.prepare('SELECT COUNT(*) AS n FROM federation_keys WHERE active = 1').get()
+  if (n > 0) return { error: 'forbidden' }
+  return { error: 'not_configured' }
+}
+function logFederationQuery(key, queryType, sku, peer, resultStatus, resultCount) {
+  db.prepare('INSERT INTO federation_query_logs (peer_warehouse_code, query_type, sku, requested_by, result_status, created_at, key_id, result_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(peer, queryType, sku ?? null, key?.name ?? peer, resultStatus, nowStamp(), key?.id ?? null, resultCount ?? null)
+}
+function warehouseNameS() {
+  const w = db.prepare('SELECT name FROM warehouses ORDER BY is_default DESC, id LIMIT 1').get()
+  return w ? w.name : WAREHOUSE_CODE
+}
+/** Dòng availability thô của kho này (gộp theo SKU + lô, kèm HSD + giá nhập lô nội bộ). */
+function localAvailabilityRows(sku) {
+  const sql = `SELECT b.sku AS sku, b.lot_id AS lot_id, l.expiry_date AS expiry_date,
+      l.purchase_price AS purchase_price,
+      SUM(b.on_hand - b.allocated - b.hold - b.damaged - b.inspect) AS available
+    FROM stock_balances b LEFT JOIN lots l ON l.lot_id = b.lot_id
+    ${sku ? 'WHERE UPPER(TRIM(b.sku)) = UPPER(TRIM(?))' : ''}
+    GROUP BY b.sku, b.lot_id, l.expiry_date, l.purchase_price
+    ORDER BY b.sku, l.expiry_date, b.lot_id`
+  const rows = sku ? db.prepare(sql).all(sku) : db.prepare(sql).all()
+  return rows.map((r) => ({ ...r, available: r6(Number(r.available) || 0) }))
+}
+/** SKU dưới mức tối thiểu theo stock_policies của kho này (cho low-stock). */
+function localLowStockRows() {
+  const policies = db.prepare('SELECT * FROM stock_policies').all()
+  const out = []
+  for (const p of policies) {
+    const threshold = p.reorder_point ?? p.min_qty ?? null
+    if (threshold == null) continue
+    const rows = db.prepare('SELECT * FROM stock_balances WHERE warehouse_id IS ? AND UPPER(TRIM(sku)) = UPPER(TRIM(?))').all(p.warehouse_id, p.sku)
+    const available = r6(rows.reduce((s, b) => s + availableOf(b), 0))
+    if (available < threshold) out.push({ sku: p.sku, available, min_qty: threshold })
+  }
+  return out.sort((a, b) => String(a.sku).localeCompare(String(b.sku)))
+}
+
+// ---------- Portal GĐ4: gọi sang kho peer (chỉ đọc) + cache minh bạch ----------
+const PORTAL_TIMEOUT_MS = 3000
+async function fetchPeerJson(peer, pathWithQuery) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), PORTAL_TIMEOUT_MS)
+  try {
+    const res = await fetch(normalizeBaseUrlS(peer.base_url) + pathWithQuery, {
+      headers: { 'x-federation-key': String(peer.api_key || ''), 'x-federation-peer': WAREHOUSE_CODE },
+      signal: ctrl.signal,
+    })
+    const json = await res.json().catch(() => ({}))
+    return { status: res.status, json }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+function markPeer(peerId, ok, error) {
+  const at = nowStamp()
+  if (ok) db.prepare("UPDATE portal_peers SET last_status = 'online', last_seen_at = ?, last_error = NULL, updated_at = ? WHERE id = ?").run(at, at, peerId)
+  else db.prepare("UPDATE portal_peers SET last_status = 'offline', last_error = ?, updated_at = ? WHERE id = ?").run(String(error || 'không rõ lỗi').slice(0, 300), at, peerId)
+  return at
+}
+function readPortalCache(peerId, kind, sku) {
+  const row = db.prepare('SELECT * FROM portal_cache WHERE peer_id = ? AND kind = ? AND sku IS ?').get(peerId, kind, sku ?? null)
+  if (!row) return null
+  try { return { payload: JSON.parse(row.payload_json), fetched_at: row.fetched_at } } catch { return null }
+}
+function writePortalCache(peerId, kind, sku, payload) {
+  const at = nowStamp()
+  db.prepare(`INSERT INTO portal_cache (peer_id, kind, sku, payload_json, fetched_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (peer_id, kind, sku) DO UPDATE SET payload_json = excluded.payload_json, fetched_at = excluded.fetched_at`)
+    .run(peerId, kind, sku ?? null, JSON.stringify(payload), at)
+  return at
+}
+const peerPublic = (p) => ({
+  id: p.id, name: p.name, base_url: p.base_url, warehouse_code: p.warehouse_code,
+  enabled: !!p.enabled, last_status: p.last_status, last_seen_at: p.last_seen_at, last_error: p.last_error,
+})
+
 // ---------- Router ----------
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
@@ -717,37 +896,285 @@ const server = http.createServer(async (req, res) => {
 
     // --- Federation (chỉ đọc, Phần 4B.4) ---
     if (p === '/federation/v1/ping' && req.method === 'GET') {
-      return sendJson(res, 200, { warehouse_code: WAREHOUSE_CODE, name: WAREHOUSE_CODE, server_time: nowStamp(), version: VERSION })
+      return sendJson(res, 200, { warehouse_code: WAREHOUSE_CODE, name: warehouseNameS(), server_time: nowStamp(), version: VERSION })
     }
-    if (p === '/federation/v1/inventory/availability' && req.method === 'GET') {
+    // Thông tin kho cho portal/kho khác — cần khoá federation hợp lệ.
+    if ((p === '/federation/info' || p === '/federation/v1/info') && req.method === 'GET') {
       const peer = String(req.headers['x-federation-peer'] || 'unknown')
-      const sku = url.searchParams.get('sku') || url.searchParams.get('q') || ''
-      if (!FEDERATION_KEY) {
-        db.prepare('INSERT INTO federation_query_logs (peer_warehouse_code, query_type, sku, requested_by, result_status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(peer, 'availability', sku, peer, 'not_configured', nowStamp())
-        return sendJson(res, 503, { error: 'federation_not_configured', message: 'Kho này chưa đặt WMS_FEDERATION_KEY' })
+      const auth = checkFederationKey(req)
+      if (auth.error === 'not_configured') {
+        logFederationQuery(null, 'info', null, peer, 'not_configured', null)
+        return sendJson(res, 503, { error: 'federation_not_configured', message: 'Kho này chưa cấu hình khoá liên kho' })
       }
-      const given = Buffer.from(String(req.headers['x-federation-key'] || ''))
-      const expect = Buffer.from(FEDERATION_KEY)
-      if (given.length !== expect.length || !crypto.timingSafeEqual(given, expect)) {
-        db.prepare('INSERT INTO federation_query_logs (peer_warehouse_code, query_type, sku, requested_by, result_status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(peer, 'availability', sku, peer, 'forbidden', nowStamp())
+      if (auth.error) {
+        logFederationQuery(null, 'info', null, peer, 'forbidden', null)
         return sendJson(res, 403, { error: 'forbidden', message: 'Khoá liên kho không đúng' })
       }
-      const rows = sku
+      logFederationQuery(auth.key, 'info', null, peer, 'ok', null)
+      return sendJson(res, 200, { warehouse_code: WAREHOUSE_CODE, warehouse_name: warehouseNameS(), server_time: nowStamp(), version: VERSION })
+    }
+    if ((p === '/federation/availability' || p === '/federation/v1/inventory/availability') && req.method === 'GET') {
+      const peer = String(req.headers['x-federation-peer'] || 'unknown')
+      const sku = url.searchParams.get('sku') || url.searchParams.get('q') || ''
+      const auth = checkFederationKey(req)
+      if (auth.error === 'not_configured') {
+        logFederationQuery(null, 'availability', sku, peer, 'not_configured', null)
+        return sendJson(res, 503, { error: 'federation_not_configured', message: 'Kho này chưa cấu hình khoá liên kho (WMS_FEDERATION_KEY hoặc khoá trong mục Liên kho)' })
+      }
+      if (auth.error) {
+        logFederationQuery(null, 'availability', sku, peer, 'forbidden', null)
+        return sendJson(res, 403, { error: 'forbidden', message: 'Khoá liên kho không đúng' })
+      }
+      if (!auth.key.share_available) {
+        logFederationQuery(auth.key, 'availability', sku, peer, 'share_disabled', 0)
+        return sendJson(res, 403, { error: 'share_available_disabled', message: 'Khoá này không được chia sẻ tồn khả dụng' })
+      }
+      // Hàng thô theo (SKU, lô, vị trí) — giữ tương thích bản GĐ-LAN.
+      const rawRows = sku
         ? db.prepare('SELECT * FROM stock_balances WHERE UPPER(TRIM(sku)) = UPPER(TRIM(?)) ORDER BY location_id, lot_id').all(sku)
         : db.prepare('SELECT * FROM stock_balances ORDER BY sku, location_id, lot_id').all()
-      const balances = rows.map((r) => ({
+      const balances = rawRows.map((r) => ({
         sku: r.sku, lot_id: r.lot_id, location_id: r.location_id, on_hand: r.on_hand, allocated: r.allocated,
         hold: r.hold, damaged: r.damaged, inspect: r.inspect, in_transit: r.in_transit, available: availableOf(r),
       }))
-      db.prepare('INSERT INTO federation_query_logs (peer_warehouse_code, query_type, sku, requested_by, result_status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(peer, 'availability', sku, peer, 'ok', nowStamp())
-      // Chỉ chia sẻ số lượng tồn — KHÔNG giá vốn, KHÔNG nhà cung cấp, KHÔNG lịch sử biến động.
+      // Dòng chuẩn hoá theo chính sách của khoá (port applySharePolicy): gộp theo
+      // SKU + lô kèm HSD gần nhất; giá vốn CHỈ đi kèm khi khoá bật share_cost_price.
+      const rows = applySharePolicyS(localAvailabilityRows(sku || null), auth.key)
+      logFederationQuery(auth.key, 'availability', sku, peer, 'ok', rows.length)
       return sendJson(res, 200, {
-        warehouse_code: WAREHOUSE_CODE, sku: sku || null, balances,
-        total_available: r6(balances.reduce((s, b) => s + b.available, 0)),
+        warehouse_code: WAREHOUSE_CODE, warehouse_name: warehouseNameS(), sku: sku || null, balances, rows,
+        total_available: r6(rows.reduce((s, b) => s + b.available, 0)),
       })
+    }
+    // Tồn thấp liên kho — CHỈ khi khoá gọi vào bật share_low_stock.
+    if ((p === '/federation/low-stock' || p === '/federation/v1/inventory/low-stock') && req.method === 'GET') {
+      const peer = String(req.headers['x-federation-peer'] || 'unknown')
+      const auth = checkFederationKey(req)
+      if (auth.error === 'not_configured') {
+        logFederationQuery(null, 'low-stock', null, peer, 'not_configured', null)
+        return sendJson(res, 503, { error: 'federation_not_configured', message: 'Kho này chưa cấu hình khoá liên kho' })
+      }
+      if (auth.error) {
+        logFederationQuery(null, 'low-stock', null, peer, 'forbidden', null)
+        return sendJson(res, 403, { error: 'forbidden', message: 'Khoá liên kho không đúng' })
+      }
+      if (!auth.key.share_low_stock) {
+        logFederationQuery(auth.key, 'low-stock', null, peer, 'share_disabled', 0)
+        return sendJson(res, 403, { error: 'share_low_stock_disabled', message: 'Kho này không chia sẻ danh sách tồn thấp với khoá của bạn' })
+      }
+      const rows = localLowStockRows()
+      logFederationQuery(auth.key, 'low-stock', null, peer, 'ok', rows.length)
+      return sendJson(res, 200, { warehouse_code: WAREHOUSE_CODE, warehouse_name: warehouseNameS(), rows })
+    }
+
+    // --- Quản trị Federation (phiên đăng nhập + quyền federation_manage) ---
+    if (p === '/api/federation/keys' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'federation_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền federation_manage' })
+      const rows = db.prepare('SELECT id, name, share_available, share_low_stock, share_cost_price, active, created_at, created_by, revoked_at, last_used_at FROM federation_keys ORDER BY id').all()
+      return sendJson(res, 200, { keys: rows })
+    }
+    if (p === '/api/federation/keys' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'federation_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền federation_manage' })
+      const body = await readBody(req)
+      const name = String(body.name || '').trim()
+      if (!name) return sendJson(res, 400, { error: 'invalid_name', message: 'Khoá liên kho cần có tên (ví dụ: tên portal/kho được cấp)' })
+      // Plaintext chỉ sinh và trả ĐÚNG 1 lần ở đây; server chỉ lưu SHA-256 hash.
+      const plain = `fed_${crypto.randomBytes(24).toString('hex')}`
+      const info = db.prepare(`INSERT INTO federation_keys (name, key_hash, share_available, share_low_stock, share_cost_price, created_at, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(name, sha256(plain), body.share_available === false ? 0 : 1, body.share_low_stock ? 1 : 0, body.share_cost_price ? 1 : 0, nowStamp(), s.username)
+      return sendJson(res, 201, {
+        id: Number(info.lastInsertRowid), name, key: plain,
+        share_available: body.share_available !== false, share_low_stock: !!body.share_low_stock, share_cost_price: !!body.share_cost_price,
+        message: 'Khoá chỉ hiển thị 1 lần này — hãy sao chép và cấp cho phía portal/kho kia ngay.',
+      })
+    }
+    const fedKeyRevoke = /^\/api\/federation\/keys\/(\d+)\/revoke$/.exec(p)
+    if (fedKeyRevoke && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'federation_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền federation_manage' })
+      const info = db.prepare("UPDATE federation_keys SET active = 0, revoked_at = ? WHERE id = ? AND active = 1").run(nowStamp(), Number(fedKeyRevoke[1]))
+      if (!info.changes) return sendJson(res, 404, { error: 'key_not_found', message: 'Không tìm thấy khoá đang hoạt động' })
+      return sendJson(res, 200, { id: Number(fedKeyRevoke[1]), active: false })
+    }
+    const fedKeyPolicy = /^\/api\/federation\/keys\/(\d+)\/policy$/.exec(p)
+    if (fedKeyPolicy && (req.method === 'GET' || req.method === 'PUT')) {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'federation_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền federation_manage' })
+      const row = db.prepare('SELECT * FROM federation_keys WHERE id = ?').get(Number(fedKeyPolicy[1]))
+      if (!row) return sendJson(res, 404, { error: 'key_not_found', message: 'Không tìm thấy khoá liên kho' })
+      if (req.method === 'GET') {
+        return sendJson(res, 200, {
+          id: row.id, name: row.name, active: !!row.active,
+          share_available: !!row.share_available, share_low_stock: !!row.share_low_stock, share_cost_price: !!row.share_cost_price,
+        })
+      }
+      const body = await readBody(req)
+      db.prepare('UPDATE federation_keys SET share_available = ?, share_low_stock = ?, share_cost_price = ? WHERE id = ?')
+        .run(body.share_available ? 1 : 0, body.share_low_stock ? 1 : 0, body.share_cost_price ? 1 : 0, row.id)
+      return sendJson(res, 200, {
+        id: row.id, name: row.name, active: !!row.active,
+        share_available: !!body.share_available, share_low_stock: !!body.share_low_stock, share_cost_price: !!body.share_cost_price,
+      })
+    }
+    if (p === '/api/federation/query-log' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'federation_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền federation_manage' })
+      const rows = db.prepare('SELECT * FROM federation_query_logs ORDER BY id DESC LIMIT 100').all()
+      return sendJson(res, 200, { logs: rows })
+    }
+
+    // --- Portal liên kho (quản trị peers: federation_manage; tra cứu: inventory_view) ---
+    if (p === '/api/portal/peers' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'federation_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền federation_manage' })
+      const rows = db.prepare('SELECT * FROM portal_peers ORDER BY id').all()
+      return sendJson(res, 200, { peers: rows.map(peerPublic) })
+    }
+    if (p === '/api/portal/peers' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'federation_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền federation_manage' })
+      const body = await readBody(req)
+      const errors = validatePeerConfigS(body)
+      if (errors.length) return sendJson(res, 400, { error: 'invalid_peer', message: errors.join('; ') })
+      const at = nowStamp()
+      const info = db.prepare('INSERT INTO portal_peers (name, base_url, api_key, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(String(body.name).trim(), normalizeBaseUrlS(body.base_url), String(body.api_key).trim(), body.enabled === false ? 0 : 1, at, at)
+      const row = db.prepare('SELECT * FROM portal_peers WHERE id = ?').get(Number(info.lastInsertRowid))
+      return sendJson(res, 201, peerPublic(row))
+    }
+    const portalPeerId = /^\/api\/portal\/peers\/(\d+)$/.exec(p)
+    if (portalPeerId && (req.method === 'PUT' || req.method === 'DELETE')) {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'federation_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền federation_manage' })
+      const id = Number(portalPeerId[1])
+      const row = db.prepare('SELECT * FROM portal_peers WHERE id = ?').get(id)
+      if (!row) return sendJson(res, 404, { error: 'peer_not_found', message: 'Không tìm thấy kho peer' })
+      if (req.method === 'DELETE') {
+        db.prepare('DELETE FROM portal_cache WHERE peer_id = ?').run(id)
+        db.prepare('DELETE FROM portal_peers WHERE id = ?').run(id)
+        return sendJson(res, 200, { id, deleted: true })
+      }
+      const body = await readBody(req)
+      const merged = {
+        name: body.name !== undefined ? body.name : row.name,
+        base_url: body.base_url !== undefined ? body.base_url : row.base_url,
+        api_key: body.api_key !== undefined && String(body.api_key).trim() ? body.api_key : row.api_key,
+      }
+      const errors = validatePeerConfigS(merged)
+      if (errors.length) return sendJson(res, 400, { error: 'invalid_peer', message: errors.join('; ') })
+      db.prepare('UPDATE portal_peers SET name = ?, base_url = ?, api_key = ?, enabled = ?, updated_at = ? WHERE id = ?')
+        .run(String(merged.name).trim(), normalizeBaseUrlS(merged.base_url), String(merged.api_key).trim(),
+          body.enabled !== undefined ? (body.enabled ? 1 : 0) : row.enabled, nowStamp(), id)
+      return sendJson(res, 200, peerPublic(db.prepare('SELECT * FROM portal_peers WHERE id = ?').get(id)))
+    }
+    const portalPeerTest = /^\/api\/portal\/peers\/(\d+)\/test$/.exec(p)
+    if (portalPeerTest && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'federation_manage')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền federation_manage' })
+      const peer = db.prepare('SELECT * FROM portal_peers WHERE id = ?').get(Number(portalPeerTest[1]))
+      if (!peer) return sendJson(res, 404, { error: 'peer_not_found', message: 'Không tìm thấy kho peer' })
+      try {
+        const ping = await fetchPeerJson(peer, '/federation/v1/ping')
+        if (ping.status !== 200) throw new Error(`ping trả HTTP ${ping.status}`)
+        const info = await fetchPeerJson(peer, '/federation/info')
+        if (info.status !== 200) throw new Error(info.json?.message || `info trả HTTP ${info.status} (khoá có thể sai)`)
+        const code = info.json.warehouse_code || ping.json.warehouse_code || null
+        db.prepare('UPDATE portal_peers SET warehouse_code = ? WHERE id = ?').run(code, peer.id)
+        const at = markPeer(peer.id, true)
+        return sendJson(res, 200, { ok: true, peer_id: peer.id, warehouse_code: code, warehouse_name: info.json.warehouse_name || null, server_time: info.json.server_time || ping.json.server_time || null, last_seen_at: at })
+      } catch (e) {
+        markPeer(peer.id, false, e.name === 'AbortError' ? 'Hết thời gian chờ (3 giây)' : String(e.message || e))
+        return sendJson(res, 200, { ok: false, peer_id: peer.id, error: String(e.message || e) })
+      }
+    }
+    if (p === '/api/portal/status' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const rows = db.prepare('SELECT * FROM portal_peers ORDER BY id').all()
+      return sendJson(res, 200, { peers: rows.map(peerPublic) })
+    }
+    if (p === '/api/portal/availability' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const sku = (url.searchParams.get('sku') || url.searchParams.get('q') || '').trim()
+      const peers = db.prepare('SELECT * FROM portal_peers WHERE enabled = 1 ORDER BY id').all()
+      const results = []
+      for (const peer of peers) {
+        try {
+          const r = await fetchPeerJson(peer, `/federation/v1/inventory/availability?sku=${encodeURIComponent(sku)}`)
+          if (r.status !== 200) throw new Error(r.json?.message || `HTTP ${r.status}`)
+          const rows = Array.isArray(r.json.rows) ? r.json.rows : []
+          const fetchedAt = writePortalCache(peer.id, 'availability', sku || null, { rows, warehouse_code: r.json.warehouse_code || peer.warehouse_code || null })
+          markPeer(peer.id, true)
+          results.push({
+            peer_id: peer.id, name: peer.name, warehouse_code: r.json.warehouse_code || peer.warehouse_code || null,
+            rows, total_available: r6(rows.reduce((sum, x) => sum + (Number(x.available) || 0), 0)),
+            stale: false, fetched_at: fetchedAt,
+          })
+        } catch (e) {
+          const msg = e.name === 'AbortError' ? 'Hết thời gian chờ (3 giây)' : String(e.message || e)
+          markPeer(peer.id, false, msg)
+          const cache = readPortalCache(peer.id, 'availability', sku || null)
+          if (cache) {
+            const rows = Array.isArray(cache.payload.rows) ? cache.payload.rows : []
+            results.push({
+              peer_id: peer.id, name: peer.name, warehouse_code: cache.payload.warehouse_code || peer.warehouse_code || null,
+              rows, total_available: r6(rows.reduce((sum, x) => sum + (Number(x.available) || 0), 0)),
+              stale: true, fetched_at: cache.fetched_at, error: msg,
+            })
+          } else {
+            results.push({ peer_id: peer.id, name: peer.name, warehouse_code: peer.warehouse_code || null, rows: [], total_available: 0, stale: false, fetched_at: null, error: msg })
+          }
+        }
+      }
+      return sendJson(res, 200, {
+        sku: sku || null, results,
+        total_available: r6(results.reduce((sum, x) => sum + x.total_available, 0)),
+      })
+    }
+    if (p === '/api/portal/low-stock' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const peers = db.prepare('SELECT * FROM portal_peers WHERE enabled = 1 ORDER BY id').all()
+      const results = []
+      for (const peer of peers) {
+        try {
+          const r = await fetchPeerJson(peer, '/federation/low-stock')
+          if (r.status === 403) {
+            // Kho đích từ chối chia sẻ tồn thấp: ghi chú rõ, KHÔNG coi là lỗi hệ thống.
+            results.push({ peer_id: peer.id, name: peer.name, warehouse_code: peer.warehouse_code || null, shared: false, rows: [], note: 'Kho không chia sẻ tồn thấp', stale: false, fetched_at: null })
+            continue
+          }
+          if (r.status !== 200) throw new Error(r.json?.message || `HTTP ${r.status}`)
+          const rows = Array.isArray(r.json.rows) ? r.json.rows : []
+          const fetchedAt = writePortalCache(peer.id, 'lowstock', null, { rows, warehouse_code: r.json.warehouse_code || peer.warehouse_code || null })
+          markPeer(peer.id, true)
+          results.push({ peer_id: peer.id, name: peer.name, warehouse_code: r.json.warehouse_code || peer.warehouse_code || null, shared: true, rows, stale: false, fetched_at: fetchedAt })
+        } catch (e) {
+          const msg = e.name === 'AbortError' ? 'Hết thời gian chờ (3 giây)' : String(e.message || e)
+          markPeer(peer.id, false, msg)
+          const cache = readPortalCache(peer.id, 'lowstock', null)
+          if (cache) {
+            results.push({ peer_id: peer.id, name: peer.name, warehouse_code: cache.payload.warehouse_code || peer.warehouse_code || null, shared: true, rows: cache.payload.rows || [], stale: true, fetched_at: cache.fetched_at, error: msg })
+          } else {
+            results.push({ peer_id: peer.id, name: peer.name, warehouse_code: peer.warehouse_code || null, shared: true, rows: [], stale: false, fetched_at: null, error: msg })
+          }
+        }
+      }
+      return sendJson(res, 200, { results })
+    }
+    // Trang portal tĩnh (HTML thuần trong server/portal.html): trang tự nhập
+    // token phiên 1 lần (lưu sessionStorage) rồi gọi các API /api/portal/*.
+    if (p === '/portal' && req.method === 'GET') {
+      const portalFile = path.join(SERVER_DIR, '..', 'portal.html')
+      if (fs.existsSync(portalFile)) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        return res.end(fs.readFileSync(portalFile))
+      }
+      return sendJson(res, 404, { error: 'portal_not_found', message: 'Thiếu file server/portal.html' })
     }
 
     // --- Auth ---
@@ -2254,6 +2681,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`Trên máy này:  http://localhost:${PORT}`)
   for (const ip of lan) console.log(`Điện thoại cùng Wi-Fi mở:  http://${ip}:${PORT}`)
   console.log(`Tài khoản quản trị: ${ADMIN_USER}${USING_DEFAULT_PASS ? ' (mật khẩu MẶC ĐỊNH — đổi ngay bằng WMS_ADMIN_PASS!)' : ''}`)
-  console.log(FEDERATION_KEY ? 'Liên kho (Federation): đã bật (có khoá).' : 'Liên kho (Federation): chưa bật (chưa đặt WMS_FEDERATION_KEY).')
+  console.log(FEDERATION_KEY ? 'Liên kho (Federation): đã bật (khoá hệ thống qua WMS_FEDERATION_KEY + khoá cấp trong mục Liên kho).' : 'Liên kho (Federation): dùng khoá cấp trong mục Liên kho của app (hoặc đặt WMS_FEDERATION_KEY).')
+  console.log(`Cổng liên kho (Portal):  http://localhost:${PORT}/portal`)
   console.log('CẢNH BÁO: chỉ dùng trong mạng LAN của kho. KHÔNG mở cổng này ra Internet; liên kho đi qua VPN (Tailscale/WireGuard).')
 })
