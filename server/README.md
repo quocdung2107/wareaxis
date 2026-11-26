@@ -111,6 +111,30 @@ thiết bị đã duyệt; quyền ghi trong ngoặc):
 Lần chạy đầu server tự seed kho chính (MAIN) với vị trí NHAN-01 (nhận hàng),
 A01-01, A01-02 (lấy hàng) nếu chưa có kho nào.
 
+## API xuất kho GĐ2 (Đơn xuất → Phân bổ → Wave → Pack → Ship → Trả hàng)
+
+Chỉ áp cho hàng theo lô của sổ cái (hàng nhận qua PO ở GĐ1). Đơn Supabase chỉ
+lưu tham chiếu (`external_ref`, tên xe dạng text) — không sửa luồng Orders.
+
+| Endpoint | Quyền | Việc |
+|---|---|---|
+| `GET /api/outbound-orders` (`?status=`) | inventory_view | Danh sách đơn xuất |
+| `POST /api/outbound-orders` | outbound_allocate | Tạo đơn xuất (body: `lines: [{sku, qty_ordered}]`, `source`, `external_ref?`, `customer_name?`, `carrier_text?`) |
+| `GET /api/outbound-orders/:id` | inventory_view | Đơn + dòng + allocations (+ backorder từng dòng) |
+| `POST /api/outbound-orders/:id/allocate` | outbound_allocate | Phân bổ FEFO/FIFO (`{policy?}`) — giữ chỗ ALLOCATE, thiếu → PARTIAL_ALLOCATED |
+| `POST /api/outbound-orders/:id/cancel` | outbound_allocate | Huỷ đơn chưa lấy — nhả giữ chỗ (DEALLOCATE) |
+| `GET /api/waves` | inventory_view | Danh sách wave |
+| `POST /api/waves` | outbound_pick | Tạo wave từ các đơn đã phân bổ (`{order_ids, carrier_text?, cutoff?}`) — sinh pick task theo lộ trình |
+| `GET /api/waves/:id/tasks` | inventory_view | Wave + danh sách pick task (kèm phần allocation của từng task) |
+| `POST /api/pick-tasks/:id/confirm` | outbound_pick | Xác nhận lấy (`{qty}`) — lấy thiếu tự nhả giữ chỗ về backorder |
+| `POST /api/outbound-orders/:id/pack` | outbound_pack | Ghi đóng gói kiểm chứng (`{scans: [{sku, qty}]}`) — sai SKU/vượt đã lấy bị chặn; đủ → PACKED |
+| `POST /api/outbound-orders/:id/ship` | outbound_ship | Giao hàng (`{carrier_text?, tracking_text?}`) — tạo phiếu giao kèm lô gốc, đơn COMPLETED |
+| `GET /api/shipments` / `GET /api/shipments/:id` | inventory_view | Phiếu giao (+ dòng kèm lot_id) |
+| `POST /api/shipments/:id/returns` | returns_receive | Nhận hàng trả (`{lines: [{shipment_item_id, qty, reason?}]}`) — về xô chờ QC của lô gốc |
+| `POST /api/returns/:id/qc` | inventory_receive | QC hàng trả (`{return_line_id, qty_pass, qty_fail, reason_code?}` — hỏng bắt buộc lý do) |
+| `POST /api/returns/:id/putaway` | inventory_putaway | Cất hàng trả đã QC đạt (`{return_line_id, qty, to_location_id}`) |
+| `GET /api/returns` | inventory_view | Phiếu trả + dòng |
+
 ## Kiểm thử server (cho người kỹ thuật)
 
 ```
@@ -119,7 +143,8 @@ node server/test-smoke.mjs
 
 Script tự mở server ở cổng test với DB tạm, chạy hết luồng
 đăng nhập → duyệt thiết bị → biến động tồn → liên kho → GĐ1 (PO → nhận →
-QC → cất hàng → kiểm balances) → sao lưu,
+QC → cất hàng → kiểm balances) → GĐ2 (đơn xuất → phân bổ → wave → lấy →
+đóng gói → giao → trả hàng về lô gốc → QC → cất lại) → sao lưu,
 xong tự dọn. Không nằm trong `npm test` chính vì cần mở cổng mạng.
 
 ## Các biến môi trường

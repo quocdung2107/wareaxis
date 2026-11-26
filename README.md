@@ -30,6 +30,39 @@ thay đổi, hai nguồn không trộn nhau. Warehouse Server (LAN) có cùng b�
 `POST /api/receipts/:id/qc`, `POST /api/receipts/:id/putaway`, `GET /api/lots`,
 `GET /api/locations` (xem `server/README.md`).
 
+## GĐ2 — Xuất kho theo lô (Đơn xuất → Phân bổ → Wave → Đóng gói → Giao → Trả hàng)
+
+Mục *Lấy hàng → Xuất kho* (chỉ áp cho hàng theo lô của sổ cái — hàng nhận qua PO;
+lệnh lấy hàng cũ cho hàng nạp file không đổi):
+
+1. **Đơn xuất** (số XH-xxxx): tạo tay tại kho hoặc từ đơn Supabase — trường hợp
+   Supabase chỉ **lưu mã đơn tham chiếu + tên xe dạng text**, không đồng bộ hai
+   chiều, không sửa luồng Orders/Carriers.
+2. **Phân bổ (allocation)**: giữ chỗ tồn thật trên lô theo **FEFO** (hết hạn sớm
+   xuất trước; hoà thì FIFO; chọn được FIFO thuần). Chỉ lấy từ lô AVAILABLE ở
+   vị trí lấy hàng/hàng khối, trừ phần đã giữ cho đơn khác, đóng băng, hỏng,
+   chờ QC. Thiếu hàng → đơn *Phân bổ một phần* và mỗi dòng hiện **backorder**.
+   Huỷ đơn (khi chưa lấy) nhả toàn bộ giữ chỗ.
+3. **Sóng lấy hàng (wave)**: tick chọn nhiều đơn đã phân bổ gộp thành 1 wave
+   (số WV-xxxx, lưu thêm xe/giờ chốt để sau lọc tự động). Hệ thống gộp các phần
+   cùng lô + vị trí thành **pick task** xếp theo lộ trình vị trí. Xác nhận lấy
+   từng task: nhập số thực lấy — lấy thiếu thì phần thiếu tự nhả về backorder.
+   Đơn lẻ không qua wave vẫn xác nhận lấy ngay trong chi tiết đơn.
+4. **Đóng gói**: quét/nhập SKU + số lượng, app đối chiếu trực tiếp với số đã
+   lấy của đơn (sai SKU hoặc vượt số đã lấy bị chặn ngay). Gói đủ → *Đã đóng gói*.
+5. **Giao hàng**: tạo phiếu giao (số GH-xxxx) kèm **lô gốc của từng dòng** —
+   móc truy vết cho hàng trả; ghi xe/đơn vị vận chuyển + mã vận đơn. Đơn hoàn
+   tất ngay khi giao (tồn đã trừ ở bước lấy hàng).
+6. **Trả hàng**: chọn phiếu giao → nhập số trả theo dòng (thấy rõ lô gốc) →
+   hàng về **khu nhận chờ QC của đúng lô gốc**, QC đạt/hỏng và cất lại lên kệ
+   bằng đúng quy trình GĐ1. Số phiếu trả TH-xxxx.
+
+Warehouse Server có cùng bộ API (xem `server/README.md`): `GET/POST
+/api/outbound-orders`, `POST /api/outbound-orders/:id/allocate|cancel|pack|ship`,
+`GET/POST /api/waves`, `GET /api/waves/:id/tasks`, `POST
+/api/pick-tasks/:id/confirm`, `GET /api/shipments`, `POST
+/api/shipments/:id/returns`, `POST /api/returns/:id/qc|putaway`.
+
 ## Triển khai lên GitHub Pages
 
 Địa chỉ app: `https://quocdung2107.github.io/wms/`

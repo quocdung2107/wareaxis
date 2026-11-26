@@ -79,6 +79,33 @@ CREATE TABLE IF NOT EXISTS po_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, po_id
 CREATE TABLE IF NOT EXISTS receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_no TEXT UNIQUE NOT NULL, po_id INTEGER, warehouse_id INTEGER, received_by TEXT, received_at TEXT, status TEXT NOT NULL DEFAULT 'QC_PENDING', created_at TEXT);
 CREATE TABLE IF NOT EXISTS receipt_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_id INTEGER NOT NULL, po_line_id INTEGER, sku TEXT NOT NULL, qty_expected REAL NOT NULL DEFAULT 0, qty_received REAL NOT NULL DEFAULT 0, qty_good REAL NOT NULL DEFAULT 0, qty_damaged REAL NOT NULL DEFAULT 0, qty_shortage REAL NOT NULL DEFAULT 0, qty_more REAL NOT NULL DEFAULT 0, lot_id INTEGER, qc_status TEXT NOT NULL DEFAULT 'PENDING', qty_qc_pass REAL NOT NULL DEFAULT 0, qty_qc_fail REAL NOT NULL DEFAULT 0, qty_putaway REAL NOT NULL DEFAULT 0, damage_reason_code TEXT);
 `)
+
+// Schema GĐ2 (tương đương phần GĐ2 trong src/shared/inventory/repo.ts):
+// outbound_orders/outbound_lines/allocations/waves/wave_orders/pick_tasks(+parts)/
+// shipments/shipment_items/returns/return_lines + các bộ đếm XH/WV/GH/TH.
+// Chỉ áp cho hàng ledger (lots/balances); Supabase Orders chỉ lưu tham chiếu text.
+db.exec(`
+CREATE TABLE IF NOT EXISTS ob_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO ob_counter (id, n) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS wave_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO wave_counter (id, n) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS shipment_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO shipment_counter (id, n) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS return_counter (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO return_counter (id, n) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS outbound_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, order_no TEXT UNIQUE NOT NULL, source TEXT NOT NULL DEFAULT 'MANUAL', external_ref TEXT, customer_name TEXT, customer_code TEXT, warehouse_id INTEGER, status TEXT NOT NULL DEFAULT 'DRAFT', carrier_text TEXT, note TEXT, created_at TEXT, updated_at TEXT, created_by TEXT);
+CREATE INDEX IF NOT EXISTS idx_ob_status ON outbound_orders(status);
+CREATE TABLE IF NOT EXISTS outbound_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, sku TEXT NOT NULL, description TEXT, uom TEXT, qty_ordered REAL NOT NULL, qty_allocated REAL NOT NULL DEFAULT 0, qty_picked REAL NOT NULL DEFAULT 0, qty_packed REAL NOT NULL DEFAULT 0, qty_shipped REAL NOT NULL DEFAULT 0, note TEXT);
+CREATE TABLE IF NOT EXISTS allocations (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, order_line_id INTEGER NOT NULL, lot_id INTEGER, location_id INTEGER, sku TEXT NOT NULL, qty_allocated REAL NOT NULL, qty_picked REAL NOT NULL DEFAULT 0, qty_shipped REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'ACTIVE', created_at TEXT);
+CREATE TABLE IF NOT EXISTS waves (id INTEGER PRIMARY KEY AUTOINCREMENT, wave_no TEXT UNIQUE NOT NULL, warehouse_id INTEGER, status TEXT NOT NULL DEFAULT 'OPEN', carrier_text TEXT, cutoff TEXT, note TEXT, created_at TEXT, created_by TEXT);
+CREATE TABLE IF NOT EXISTS wave_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, wave_id INTEGER NOT NULL, order_id INTEGER NOT NULL, UNIQUE (wave_id, order_id));
+CREATE TABLE IF NOT EXISTS pick_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, wave_id INTEGER, allocation_id INTEGER, order_id INTEGER, order_line_id INTEGER, location_id INTEGER, location_code TEXT, lot_id INTEGER, sku TEXT NOT NULL, qty_need REAL NOT NULL, qty_picked REAL NOT NULL DEFAULT 0, pick_sequence INTEGER, status TEXT NOT NULL DEFAULT 'PENDING', picked_by TEXT, picked_at TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS pick_task_allocations (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL, allocation_id INTEGER NOT NULL, qty_covered REAL NOT NULL, UNIQUE (task_id, allocation_id));
+CREATE TABLE IF NOT EXISTS shipments (id INTEGER PRIMARY KEY AUTOINCREMENT, shipment_no TEXT UNIQUE NOT NULL, order_id INTEGER NOT NULL, carrier_text TEXT, tracking_text TEXT, status TEXT NOT NULL DEFAULT 'SHIPPED', shipped_at TEXT, shipped_by TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS shipment_items (id INTEGER PRIMARY KEY AUTOINCREMENT, shipment_id INTEGER NOT NULL, order_id INTEGER, order_line_id INTEGER, allocation_id INTEGER, sku TEXT NOT NULL, lot_id INTEGER, location_id INTEGER, qty REAL NOT NULL, qty_returned REAL NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS returns (id INTEGER PRIMARY KEY AUTOINCREMENT, return_no TEXT UNIQUE NOT NULL, shipment_id INTEGER, order_id INTEGER, customer_name TEXT, status TEXT NOT NULL DEFAULT 'RECEIVED', note TEXT, created_at TEXT, created_by TEXT);
+CREATE TABLE IF NOT EXISTS return_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, return_id INTEGER NOT NULL, shipment_item_id INTEGER, sku TEXT NOT NULL, lot_id INTEGER, qty_returned REAL NOT NULL, qty_qc_pass REAL NOT NULL DEFAULT 0, qty_qc_fail REAL NOT NULL DEFAULT 0, qty_putaway REAL NOT NULL DEFAULT 0, qc_status TEXT NOT NULL DEFAULT 'PENDING', reason TEXT, damage_reason_code TEXT);
+`)
 {
   const cols = db.prepare('PRAGMA table_info(stock_movements)').all().map((c) => c.name)
   if (!cols.includes('into_inspect')) db.exec('ALTER TABLE stock_movements ADD COLUMN into_inspect INTEGER NOT NULL DEFAULT 0')
@@ -148,14 +175,17 @@ const nowStamp = () => {
 
 // ---------- Phân quyền (port từ src/domain/permissions/roles.ts + guard.ts) ----------
 // 'purchase_receive' bổ sung ở GĐ1 — nguồn: src/domain/permissions/roles.ts.
+// 'outbound_*' + 'returns_receive' bổ sung ở GĐ2 — nguồn: src/domain/permissions/roles.ts.
 const PERMISSIONS = ['inventory_view', 'inventory_receive', 'inventory_putaway', 'inventory_pick', 'inventory_count',
-  'inventory_adjust', 'inventory_transfer', 'purchase_create', 'purchase_receive', 'reports_view', 'users_manage', 'devices_manage',
+  'inventory_adjust', 'inventory_transfer', 'purchase_create', 'purchase_receive',
+  'outbound_allocate', 'outbound_pick', 'outbound_pack', 'outbound_ship', 'returns_receive',
+  'reports_view', 'users_manage', 'devices_manage',
   'backup_manage', 'federation_manage']
 const ROLE_PERMISSIONS = {
   KHO_ADMIN: PERMISSIONS,
-  THU_KHO: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'inventory_pick', 'inventory_count', 'inventory_adjust', 'inventory_transfer', 'purchase_create', 'purchase_receive', 'reports_view'],
-  NV_LAY_HANG: ['inventory_view', 'inventory_pick'],
-  NV_NHAN_HANG: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'purchase_receive'],
+  THU_KHO: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'inventory_pick', 'inventory_count', 'inventory_adjust', 'inventory_transfer', 'purchase_create', 'purchase_receive', 'outbound_allocate', 'outbound_pick', 'outbound_pack', 'outbound_ship', 'returns_receive', 'reports_view'],
+  NV_LAY_HANG: ['inventory_view', 'inventory_pick', 'outbound_pick', 'outbound_pack'],
+  NV_NHAN_HANG: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'purchase_receive', 'returns_receive'],
   KE_TOAN_XEM: ['inventory_view', 'reports_view'],
 }
 const can = (role, perm) => (ROLE_PERMISSIONS[role] || []).includes(perm)
@@ -383,6 +413,64 @@ function getPoFull(id) {
   const receipts = db.prepare('SELECT * FROM receipts WHERE po_id = ? ORDER BY id').all(id)
     .map((r) => ({ ...r, lines: db.prepare('SELECT * FROM receipt_lines WHERE receipt_id = ? ORDER BY id').all(r.id) }))
   return { order, lines, receipts }
+}
+
+// ---------- Outbound GĐ2 (port từ src/domain/outbound/* — giữ khớp bản TS) ----------
+const OB_CANCELLABLE = ['DRAFT', 'ALLOCATED', 'PARTIAL_ALLOCATED']
+function getObFull(id) {
+  const order = db.prepare('SELECT * FROM outbound_orders WHERE id = ?').get(id)
+  if (!order) return null
+  const lines = db.prepare('SELECT * FROM outbound_lines WHERE order_id = ? ORDER BY id').all(id)
+    .map((l) => ({ ...l, backorder: Math.max(0, r6(l.qty_ordered - l.qty_allocated)) }))
+  const allocations = db.prepare(`SELECT a.*, COALESCE(loc.code, '') AS location_code FROM allocations a
+    LEFT JOIN locations loc ON loc.id = a.location_id WHERE a.order_id = ? ORDER BY a.id`).all(id)
+  const w = db.prepare(`SELECT w.wave_no FROM wave_orders wo JOIN waves w ON w.id = wo.wave_id
+    WHERE wo.order_id = ? AND w.status IN ('OPEN', 'PICKING') ORDER BY w.id DESC LIMIT 1`).get(id)
+  return { order, lines, allocations, active_wave_no: w ? w.wave_no : '' }
+}
+const candidateAvailableS = (c) => Math.max(0, r6(c.on_hand - c.allocated - c.hold - c.damaged - c.inspect))
+function loadObCandidates(sku) {
+  return db.prepare(`SELECT b.lot_id, b.location_id, b.sku, b.on_hand, b.allocated, b.hold, b.damaged, b.inspect,
+      l.status AS lot_status, l.expiry_date, loc.loc_type, loc.code AS location_code, loc.active AS location_active
+    FROM stock_balances b JOIN lots l ON l.lot_id = b.lot_id JOIN locations loc ON loc.id = b.location_id
+    WHERE UPPER(TRIM(b.sku)) = UPPER(TRIM(?)) AND b.lot_id IS NOT NULL AND b.location_id IS NOT NULL`).all(sku)
+    .filter((c) => c.lot_status === 'AVAILABLE' && ['PICKABLE', 'BULK'].includes(c.loc_type || '')
+      && c.location_active !== 0 && candidateAvailableS(c) > 0)
+}
+function allocateLineS(sku, qty, candidates, policy) {
+  const byFefo = (a, b) => {
+    const ea = a.expiry_date || null; const eb = b.expiry_date || null
+    if (ea && eb && ea !== eb) return ea < eb ? -1 : 1
+    if (ea && !eb) return -1
+    if (!ea && eb) return 1
+    return a.lot_id - b.lot_id
+  }
+  const sorted = [...candidates].sort(policy === 'FIFO' ? (a, b) => a.lot_id - b.lot_id : byFefo)
+  const allocations = []
+  let remaining = r6(qty)
+  for (const c of sorted) {
+    if (remaining <= 0) break
+    const take = Math.min(candidateAvailableS(c), remaining)
+    if (take > 0) { allocations.push({ lot_id: c.lot_id, location_id: c.location_id, qty: r6(take) }); remaining = r6(remaining - take) }
+  }
+  return { allocations, qty_allocated: r6(qty - remaining), backorder: remaining }
+}
+const retPendingQcS = (l) => r6(l.qty_returned - l.qty_qc_pass - l.qty_qc_fail)
+const retAwaitingPutawayS = (l) => r6(l.qty_qc_pass - l.qty_putaway)
+/** Sau QC/putaway hàng trả: cập nhật trạng thái phiếu trả + lô sinh từ phiếu trả. */
+function refreshReturnS(returnId, changedLineId) {
+  const lines = db.prepare('SELECT * FROM return_lines WHERE return_id = ?').all(returnId)
+  const qcDone = lines.every((l) => retPendingQcS(l) <= 0)
+  const status = !qcDone ? 'RECEIVED' : (lines.every((l) => retAwaitingPutawayS(l) <= 0) ? 'DONE' : 'QC_DONE')
+  db.prepare('UPDATE returns SET status = ? WHERE id = ?').run(status, returnId)
+  const line = lines.find((l) => l.id === changedLineId)
+  if (line && line.lot_id != null) {
+    const { n } = db.prepare('SELECT COUNT(*) AS n FROM receipt_lines WHERE lot_id = ?').get(line.lot_id)
+    if (n === 0) {
+      const adapted = { qty_received: line.qty_returned, qty_qc_pass: line.qty_qc_pass, qty_qc_fail: line.qty_qc_fail, qty_putaway: line.qty_putaway }
+      db.prepare('UPDATE lots SET status = ? WHERE lot_id = ?').run(lotStatusAfterS(adapted), line.lot_id)
+    }
+  }
 }
 
 // ---------- Router ----------
@@ -777,6 +865,587 @@ const server = http.createServer(async (req, res) => {
         zones: db.prepare('SELECT * FROM zones ORDER BY id').all(),
         locations: db.prepare('SELECT * FROM locations ORDER BY pick_sequence, code').all(),
       })
+    }
+
+    // --- Outbound GĐ2: đơn xuất -> phân bổ -> wave/pick -> pack -> ship -> returns ---
+    if (p === '/api/outbound-orders' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const status = url.searchParams.get('status')
+      const rows = status
+        ? db.prepare('SELECT * FROM outbound_orders WHERE status = ? ORDER BY id DESC').all(status)
+        : db.prepare('SELECT * FROM outbound_orders ORDER BY id DESC').all()
+      return sendJson(res, 200, { outbound_orders: rows })
+    }
+    if (p === '/api/outbound-orders' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'outbound_allocate')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền outbound_allocate' })
+      const body = await readBody(req)
+      const lines = Array.isArray(body.lines) ? body.lines : []
+      if (!lines.length) return sendJson(res, 400, { error: 'invalid_order', message: 'Đơn xuất phải có ít nhất 1 dòng hàng' })
+      for (const l of lines) {
+        if (!String(l.sku || '').trim()) return sendJson(res, 400, { error: 'invalid_order', message: 'Dòng đơn xuất thiếu SKU' })
+        if (!Number.isFinite(Number(l.qty_ordered)) || Number(l.qty_ordered) <= 0) {
+          return sendJson(res, 400, { error: 'invalid_order', message: `Dòng ${l.sku}: số lượng xuất phải lớn hơn 0` })
+        }
+      }
+      const at = nowStamp()
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        db.prepare('UPDATE ob_counter SET n = n + 1 WHERE id = 1').run()
+        const info = db.prepare(`INSERT INTO outbound_orders (order_no, source, external_ref, customer_name, customer_code, warehouse_id, status, carrier_text, note, created_at, updated_at, created_by)
+          VALUES ((SELECT 'XH-' || printf('%04d', n) FROM ob_counter WHERE id = 1), ?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)`)
+          .run(body.source ?? 'MANUAL', body.external_ref ?? null, body.customer_name ?? null, body.customer_code ?? null,
+            body.warehouse_id ?? defaultWarehouseId(), body.carrier_text ?? null, body.note ?? null, at, at, s.username)
+        const orderId = Number(info.lastInsertRowid)
+        const insLine = db.prepare('INSERT INTO outbound_lines (order_id, sku, description, uom, qty_ordered, note) VALUES (?, ?, ?, ?, ?, ?)')
+        for (const l of lines) insLine.run(orderId, String(l.sku).trim(), l.description ?? null, l.uom ?? null, Number(l.qty_ordered), l.note ?? null)
+        db.exec('COMMIT')
+        const o = db.prepare('SELECT order_no FROM outbound_orders WHERE id = ?').get(orderId)
+        return sendJson(res, 201, { id: orderId, order_no: o.order_no })
+      } catch (e) {
+        db.exec('ROLLBACK')
+        return sendJson(res, 400, { error: 'order_rejected', message: String(e.message || e) })
+      }
+    }
+    const obIdMatch = /^\/api\/outbound-orders\/(\d+)$/.exec(p)
+    if (obIdMatch && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const full = getObFull(Number(obIdMatch[1]))
+      if (!full) return sendJson(res, 404, { error: 'order_not_found', message: 'Không tìm thấy đơn xuất' })
+      return sendJson(res, 200, full)
+    }
+    const obAllocate = /^\/api\/outbound-orders\/(\d+)\/allocate$/.exec(p)
+    if (obAllocate && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'outbound_allocate')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền outbound_allocate' })
+      const body = await readBody(req)
+      const orderId = Number(obAllocate[1])
+      const full = getObFull(orderId)
+      if (!full) return sendJson(res, 404, { error: 'order_not_found', message: 'Không tìm thấy đơn xuất' })
+      const { order, lines } = full
+      if (!['DRAFT', 'PARTIAL_ALLOCATED'].includes(order.status)) {
+        return sendJson(res, 400, { error: 'not_allocatable', message: `Đơn đang ở trạng thái ${order.status}, không phân bổ thêm được` })
+      }
+      const policy = ['FEFO', 'FIFO', 'FEFO_THEN_FIFO'].includes(String(body.policy)) ? String(body.policy) : 'FEFO_THEN_FIFO'
+      const consumed = new Map()
+      const movements = []
+      const results = []
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        const insAlloc = db.prepare(`INSERT INTO allocations (order_id, order_line_id, lot_id, location_id, sku, qty_allocated, status, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`)
+        for (const line of lines) {
+          const need = r6(line.qty_ordered - line.qty_allocated)
+          if (need <= 0) { results.push({ line_id: line.id, sku: line.sku, qty_allocated: 0, backorder: 0 }); continue }
+          const cands = loadObCandidates(line.sku).map((c) => {
+            const extra = consumed.get(`${c.location_id}|${c.lot_id}`) || 0
+            return extra > 0 ? { ...c, allocated: r6(c.allocated + extra) } : c
+          })
+          const r = allocateLineS(line.sku, need, cands, policy)
+          for (const sl of r.allocations) {
+            insAlloc.run(orderId, line.id, sl.lot_id, sl.location_id, line.sku, sl.qty, nowStamp())
+            consumed.set(`${sl.location_id}|${sl.lot_id}`, r6((consumed.get(`${sl.location_id}|${sl.lot_id}`) || 0) + sl.qty))
+            movements.push({
+              type: 'ALLOCATE', sku: line.sku, lot_id: sl.lot_id, qty: sl.qty, warehouse_id: order.warehouse_id,
+              location_id: sl.location_id, doc_type: 'PICK_ORDER', doc_id: orderId, doc_line_id: line.id,
+            })
+          }
+          line.qty_allocated = r6(line.qty_allocated + r.qty_allocated)
+          db.prepare('UPDATE outbound_lines SET qty_allocated = ? WHERE id = ?').run(line.qty_allocated, line.id)
+          results.push({ line_id: line.id, sku: line.sku, qty_allocated: r.qty_allocated, backorder: r.backorder })
+        }
+        const fullAlloc = lines.every((l) => r6(l.qty_allocated) + EPS >= l.qty_ordered)
+        db.prepare('UPDATE outbound_orders SET status = ?, updated_at = ? WHERE id = ?')
+          .run(fullAlloc ? 'ALLOCATED' : 'PARTIAL_ALLOCATED', nowStamp(), orderId)
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        return sendJson(res, 400, { error: 'allocate_rejected', message: String(e.message || e) })
+      }
+      try {
+        for (const m of movements) applyMovementTxn(m, s.username)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      const after = getObFull(orderId)
+      return sendJson(res, 200, { id: orderId, status: after.order.status, results })
+    }
+    const obCancel = /^\/api\/outbound-orders\/(\d+)\/cancel$/.exec(p)
+    if (obCancel && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'outbound_allocate')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền outbound_allocate' })
+      const orderId = Number(obCancel[1])
+      const full = getObFull(orderId)
+      if (!full) return sendJson(res, 404, { error: 'order_not_found', message: 'Không tìm thấy đơn xuất' })
+      const { order, allocations } = full
+      if (full.active_wave_no) return sendJson(res, 400, { error: 'in_wave', message: `Đơn đang nằm trong wave ${full.active_wave_no}` })
+      if (allocations.some((a) => a.qty_picked > 0)) {
+        return sendJson(res, 400, { error: 'already_picked', message: 'Đơn đã lấy hàng một phần — không huỷ được' })
+      }
+      if (!OB_CANCELLABLE.includes(order.status)) {
+        return sendJson(res, 400, { error: 'not_cancellable', message: `Đơn đang ở trạng thái ${order.status}, không huỷ được` })
+      }
+      const movements = []
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        for (const a of allocations) {
+          if (a.status !== 'ACTIVE') continue
+          const remaining = r6(a.qty_allocated - a.qty_picked)
+          if (remaining > 0) {
+            movements.push({
+              type: 'DEALLOCATE', sku: a.sku, lot_id: a.lot_id, qty: remaining, warehouse_id: order.warehouse_id,
+              location_id: a.location_id, doc_type: 'PICK_ORDER', doc_id: orderId, doc_line_id: a.order_line_id,
+            })
+            db.prepare('UPDATE outbound_lines SET qty_allocated = qty_allocated - ? WHERE id = ?').run(remaining, a.order_line_id)
+          }
+          db.prepare("UPDATE allocations SET status = 'RELEASED' WHERE id = ?").run(a.id)
+        }
+        db.prepare("UPDATE outbound_orders SET status = 'CANCELLED', updated_at = ? WHERE id = ?").run(nowStamp(), orderId)
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        return sendJson(res, 400, { error: 'cancel_rejected', message: String(e.message || e) })
+      }
+      try {
+        for (const m of movements) applyMovementTxn(m, s.username)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      return sendJson(res, 200, { id: orderId, status: 'CANCELLED' })
+    }
+    if (p === '/api/waves' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      return sendJson(res, 200, { waves: db.prepare('SELECT * FROM waves ORDER BY id DESC').all() })
+    }
+    if (p === '/api/waves' && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'outbound_pick')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền outbound_pick' })
+      const body = await readBody(req)
+      const orderIds = Array.isArray(body.order_ids) ? body.order_ids.map(Number) : []
+      if (!orderIds.length) return sendJson(res, 400, { error: 'invalid_wave', message: 'Chưa chọn đơn nào cho wave' })
+      const inputs = []
+      let warehouseId = null
+      for (const oid of orderIds) {
+        const full = getObFull(oid)
+        if (!full) return sendJson(res, 404, { error: 'order_not_found', message: `Không tìm thấy đơn xuất #${oid}` })
+        if (full.active_wave_no) return sendJson(res, 400, { error: 'in_wave', message: `Đơn ${full.order.order_no} đã nằm trong wave ${full.active_wave_no}` })
+        if (!['ALLOCATED', 'PARTIAL_ALLOCATED'].includes(full.order.status)) {
+          return sendJson(res, 400, { error: 'not_ready', message: `Đơn ${full.order.order_no} đang ở trạng thái ${full.order.status}` })
+        }
+        warehouseId = warehouseId ?? full.order.warehouse_id
+        for (const a of full.allocations) {
+          if (a.status !== 'ACTIVE') continue
+          const remaining = r6(a.qty_allocated - a.qty_picked)
+          if (remaining <= 0 || a.location_id == null || a.lot_id == null) continue
+          const loc = db.prepare('SELECT code, pick_sequence FROM locations WHERE id = ?').get(a.location_id)
+          inputs.push({
+            allocation_id: a.id, order_id: oid, order_line_id: a.order_line_id, lot_id: a.lot_id,
+            location_id: a.location_id, location_code: loc ? loc.code : '', pick_sequence: loc ? loc.pick_sequence : null,
+            sku: a.sku, qty_remaining: remaining,
+          })
+        }
+      }
+      // Gộp theo (lô, vị trí), sắp theo lộ trình lấy — port buildPickTasks.
+      const groups = new Map()
+      for (const a of inputs) {
+        const key = `${a.location_id}|${a.lot_id}`
+        if (!groups.has(key)) groups.set(key, { ...a, qty_need: 0, parts: [] })
+        const g = groups.get(key)
+        g.qty_need = r6(g.qty_need + a.qty_remaining)
+        const part = g.parts.find((x) => x.allocation_id === a.allocation_id)
+        if (part) part.qty = r6(part.qty + a.qty_remaining)
+        else g.parts.push({ allocation_id: a.allocation_id, qty: a.qty_remaining })
+      }
+      const tasks = [...groups.values()].sort((x, y) =>
+        (x.pick_sequence ?? Number.MAX_SAFE_INTEGER) - (y.pick_sequence ?? Number.MAX_SAFE_INTEGER)
+        || String(x.location_code).localeCompare(String(y.location_code)) || x.lot_id - y.lot_id)
+      if (!tasks.length) return sendJson(res, 400, { error: 'invalid_wave', message: 'Các đơn đã chọn không còn allocation nào cần lấy' })
+      const at = nowStamp()
+      let waveId; let waveNo
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        db.prepare('UPDATE wave_counter SET n = n + 1 WHERE id = 1').run()
+        const info = db.prepare(`INSERT INTO waves (wave_no, warehouse_id, status, carrier_text, cutoff, note, created_at, created_by)
+          VALUES ((SELECT 'WV-' || printf('%04d', n) FROM wave_counter WHERE id = 1), ?, 'OPEN', ?, ?, ?, ?, ?)`)
+          .run(warehouseId, body.carrier_text ?? null, body.cutoff ?? null, body.note ?? null, at, s.username)
+        waveId = Number(info.lastInsertRowid)
+        waveNo = db.prepare('SELECT wave_no FROM waves WHERE id = ?').get(waveId).wave_no
+        const insWo = db.prepare('INSERT INTO wave_orders (wave_id, order_id) VALUES (?, ?)')
+        for (const oid of orderIds) insWo.run(waveId, oid)
+        const insTask = db.prepare(`INSERT INTO pick_tasks (wave_id, allocation_id, order_id, order_line_id, location_id, location_code, lot_id, sku, qty_need, pick_sequence, status, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)`)
+        const insPart = db.prepare('INSERT INTO pick_task_allocations (task_id, allocation_id, qty_covered) VALUES (?, ?, ?)')
+        for (const t of tasks) {
+          const first = inputs.find((i) => i.allocation_id === t.parts[0].allocation_id)
+          const ti = insTask.run(waveId, first.allocation_id, first.order_id, first.order_line_id, t.location_id,
+            t.location_code, t.lot_id, t.sku, t.qty_need, t.pick_sequence, at)
+          for (const part of t.parts) insPart.run(Number(ti.lastInsertRowid), part.allocation_id, part.qty)
+        }
+        for (const oid of orderIds) {
+          db.prepare("UPDATE outbound_orders SET status = 'PICKING', updated_at = ? WHERE id = ? AND status IN ('ALLOCATED', 'PARTIAL_ALLOCATED')").run(at, oid)
+        }
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        return sendJson(res, 400, { error: 'wave_rejected', message: String(e.message || e) })
+      }
+      return sendJson(res, 201, { wave_id: waveId, wave_no: waveNo, task_count: tasks.length })
+    }
+    const waveTasks = /^\/api\/waves\/(\d+)\/tasks$/.exec(p)
+    if (waveTasks && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const wave = db.prepare('SELECT * FROM waves WHERE id = ?').get(Number(waveTasks[1]))
+      if (!wave) return sendJson(res, 404, { error: 'wave_not_found', message: 'Không tìm thấy wave' })
+      const tasks = db.prepare('SELECT * FROM pick_tasks WHERE wave_id = ? ORDER BY pick_sequence, location_code, id').all(wave.id)
+        .map((t) => ({
+          ...t,
+          parts: db.prepare('SELECT allocation_id, qty_covered FROM pick_task_allocations WHERE task_id = ? ORDER BY allocation_id').all(t.id),
+        }))
+      const orderNos = db.prepare('SELECT o.order_no FROM wave_orders wo JOIN outbound_orders o ON o.id = wo.order_id WHERE wo.wave_id = ? ORDER BY o.id').all(wave.id).map((r) => r.order_no)
+      return sendJson(res, 200, { wave, order_nos: orderNos, tasks })
+    }
+    const pickConfirm = /^\/api\/pick-tasks\/(\d+)\/confirm$/.exec(p)
+    if (pickConfirm && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'outbound_pick')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền outbound_pick' })
+      const body = await readBody(req)
+      const task = db.prepare('SELECT * FROM pick_tasks WHERE id = ?').get(Number(pickConfirm[1]))
+      if (!task) return sendJson(res, 404, { error: 'task_not_found', message: 'Không tìm thấy pick task' })
+      if (task.status !== 'PENDING') return sendJson(res, 400, { error: 'task_done', message: `Task đã xác nhận (${task.status})` })
+      const qtyActual = Number(body.qty)
+      if (!Number.isFinite(qtyActual) || qtyActual < 0) {
+        return sendJson(res, 400, { error: 'invalid_pick', message: 'Số lượng thực lấy không hợp lệ' })
+      }
+      const parts = db.prepare('SELECT * FROM pick_task_allocations WHERE task_id = ? ORDER BY allocation_id').all(task.id)
+      const totalCovered = r6(parts.reduce((sum, x) => sum + x.qty_covered, 0))
+      if (r6(qtyActual) > totalCovered + EPS) {
+        return sendJson(res, 400, { error: 'invalid_pick', message: `Lấy vượt số đã phân bổ cho task: ${qtyActual} > ${totalCovered}` })
+      }
+      const wave = db.prepare('SELECT * FROM waves WHERE id = ?').get(task.wave_id)
+      const movements = []
+      const slices = []
+      let remaining = r6(qtyActual)
+      for (const part of parts) {
+        const a = db.prepare('SELECT * FROM allocations WHERE id = ?').get(part.allocation_id)
+        const cap = Math.min(part.qty_covered, r6(a.qty_allocated - a.qty_picked))
+        const take = Math.min(cap, remaining)
+        remaining = r6(remaining - take)
+        const release = r6(cap - take)
+        slices.push({ a, take, release })
+        if (take > 0) movements.push({
+          type: 'PICK', sku: a.sku, lot_id: a.lot_id, qty: take, warehouse_id: wave ? wave.warehouse_id : null,
+          location_id: a.location_id, doc_type: 'PICK_ORDER', doc_id: a.order_id, doc_line_id: a.order_line_id,
+        })
+        if (release > 0) movements.push({
+          type: 'DEALLOCATE', sku: a.sku, lot_id: a.lot_id, qty: release, warehouse_id: wave ? wave.warehouse_id : null,
+          location_id: a.location_id, doc_type: 'PICK_ORDER', doc_id: a.order_id, doc_line_id: a.order_line_id,
+        })
+      }
+      try {
+        for (const m of movements) applyMovementTxn(m, s.username)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      let totalPicked = 0; let totalReleased = 0
+      for (const { a, take, release } of slices) {
+        const pickedAfter = r6(a.qty_picked + take)
+        const allocatedAfter = r6(a.qty_allocated - release)
+        const st = pickedAfter + EPS >= allocatedAfter ? (release > 0 ? 'SHORT' : 'PICKED') : 'ACTIVE'
+        db.prepare('UPDATE allocations SET qty_allocated = ?, qty_picked = ?, status = ? WHERE id = ?')
+          .run(allocatedAfter, pickedAfter, st, a.id)
+        db.prepare('UPDATE outbound_lines SET qty_picked = qty_picked + ?, qty_allocated = qty_allocated - ? WHERE id = ?')
+          .run(take, release, a.order_line_id)
+        totalPicked = r6(totalPicked + take); totalReleased = r6(totalReleased + release)
+      }
+      const taskStatus = totalReleased > 0 ? 'SHORT' : 'PICKED'
+      db.prepare('UPDATE pick_tasks SET qty_picked = ?, status = ?, picked_by = ?, picked_at = ? WHERE id = ?')
+        .run(totalPicked, taskStatus, s.username, nowStamp(), task.id)
+      const { n: rest } = db.prepare("SELECT COUNT(*) AS n FROM pick_tasks WHERE wave_id = ? AND status = 'PENDING'").get(task.wave_id)
+      db.prepare('UPDATE waves SET status = ? WHERE id = ?').run(rest === 0 ? 'DONE' : 'PICKING', task.wave_id)
+      return sendJson(res, 200, { task_id: task.id, status: taskStatus, qty_picked: totalPicked, qty_released: totalReleased })
+    }
+    const obPack = /^\/api\/outbound-orders\/(\d+)\/pack$/.exec(p)
+    if (obPack && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'outbound_pack')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền outbound_pack' })
+      const body = await readBody(req)
+      const orderId = Number(obPack[1])
+      const full = getObFull(orderId)
+      if (!full) return sendJson(res, 404, { error: 'order_not_found', message: 'Không tìm thấy đơn xuất' })
+      if (full.order.status !== 'PICKING') {
+        return sendJson(res, 400, { error: 'not_packable', message: `Đơn đang ở trạng thái ${full.order.status} — cần PICKING mới đóng gói được` })
+      }
+      const scans = Array.isArray(body.scans) ? body.scans : []
+      if (!scans.length) return sendJson(res, 400, { error: 'invalid_pack', message: 'Chưa có dòng đóng gói nào' })
+      // Kiểm chứng tuần tự theo SKU (port summarizePack): sai SKU / vượt đã lấy -> 400.
+      const working = full.lines.map((l) => ({ ...l }))
+      for (const scan of scans) {
+        const sku = String(scan.sku || '').trim()
+        const qty = Number(scan.qty)
+        if (!sku || !Number.isFinite(qty) || qty <= 0) {
+          return sendJson(res, 400, { error: 'invalid_pack', message: 'Dòng đóng gói thiếu SKU hoặc SL không hợp lệ' })
+        }
+        const sameSku = working.filter((l) => l.sku.trim().toUpperCase() === sku.toUpperCase())
+        const picked = r6(sameSku.reduce((sum, l) => sum + l.qty_picked, 0))
+        const packed = r6(sameSku.reduce((sum, l) => sum + l.qty_packed, 0))
+        if (!sameSku.length || picked <= 0) {
+          return sendJson(res, 400, { error: 'invalid_pack', message: `SKU ${sku} không thuộc phần đã lấy của đơn này` })
+        }
+        if (r6(packed + qty) > picked + EPS) {
+          return sendJson(res, 400, { error: 'invalid_pack', message: `Đóng gói vượt số đã lấy của ${sku}: đã gói ${packed} + ${qty} > đã lấy ${picked}` })
+        }
+        let left = r6(qty)
+        for (const l of working) {
+          if (left <= 0) break
+          if (l.sku.trim().toUpperCase() !== sku.toUpperCase()) continue
+          const add = Math.min(r6(l.qty_picked - l.qty_packed), left)
+          l.qty_packed = r6(l.qty_packed + add); left = r6(left - add)
+        }
+      }
+      for (const l of working) {
+        db.prepare('UPDATE outbound_lines SET qty_packed = ? WHERE id = ?').run(l.qty_packed, l.id)
+      }
+      const bySku = new Map()
+      for (const l of working) {
+        const k = l.sku.trim().toUpperCase()
+        const cur = bySku.get(k) || { sku: k, qty_packed: 0, qty_picked: 0 }
+        cur.qty_packed = r6(cur.qty_packed + l.qty_packed); cur.qty_picked = r6(cur.qty_picked + l.qty_picked)
+        bySku.set(k, cur)
+      }
+      const items = [...bySku.values()].filter((i) => i.qty_picked > 0 || i.qty_packed > 0)
+      const complete = items.length > 0 && items.every((i) => r6(i.qty_packed) + EPS >= i.qty_picked)
+      if (complete) db.prepare("UPDATE outbound_orders SET status = 'PACKED', updated_at = ? WHERE id = ?").run(nowStamp(), orderId)
+      return sendJson(res, 200, { id: orderId, complete, items })
+    }
+    const obShip = /^\/api\/outbound-orders\/(\d+)\/ship$/.exec(p)
+    if (obShip && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'outbound_ship')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền outbound_ship' })
+      const body = await readBody(req)
+      const orderId = Number(obShip[1])
+      const full = getObFull(orderId)
+      if (!full) return sendJson(res, 404, { error: 'order_not_found', message: 'Không tìm thấy đơn xuất' })
+      if (full.order.status !== 'PACKED') {
+        return sendJson(res, 400, { error: 'not_shippable', message: `Đơn đang ở trạng thái ${full.order.status} — cần PACKED mới giao được` })
+      }
+      const shippable = full.allocations.filter((a) => r6(a.qty_picked - a.qty_shipped) > 0)
+      if (!shippable.length) return sendJson(res, 400, { error: 'not_shippable', message: 'Không có allocation nào đã lấy để giao' })
+      const at = nowStamp()
+      let shipmentId; let shipmentNo
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        db.prepare('UPDATE shipment_counter SET n = n + 1 WHERE id = 1').run()
+        const info = db.prepare(`INSERT INTO shipments (shipment_no, order_id, carrier_text, tracking_text, status, shipped_at, shipped_by, created_at)
+          VALUES ((SELECT 'GH-' || printf('%04d', n) FROM shipment_counter WHERE id = 1), ?, ?, ?, 'SHIPPED', ?, ?, ?)`)
+          .run(orderId, body.carrier_text ?? full.order.carrier_text ?? null, body.tracking_text ?? null, at, s.username, at)
+        shipmentId = Number(info.lastInsertRowid)
+        shipmentNo = db.prepare('SELECT shipment_no FROM shipments WHERE id = ?').get(shipmentId).shipment_no
+        const insItem = db.prepare(`INSERT INTO shipment_items (shipment_id, order_id, order_line_id, allocation_id, sku, lot_id, location_id, qty)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        for (const a of shippable) {
+          insItem.run(shipmentId, orderId, a.order_line_id, a.id, a.sku, a.lot_id, a.location_id, r6(a.qty_picked - a.qty_shipped))
+          db.prepare('UPDATE allocations SET qty_shipped = ? WHERE id = ?').run(a.qty_picked, a.id)
+        }
+        for (const l of full.lines) {
+          db.prepare('UPDATE outbound_lines SET qty_shipped = ? WHERE id = ?').run(l.qty_picked, l.id)
+        }
+        // MVP: SHIPPED -> COMPLETED gộp ngay khi giao; không movement tồn (PICK đã trừ on_hand).
+        db.prepare("UPDATE outbound_orders SET status = 'COMPLETED', updated_at = ? WHERE id = ?").run(at, orderId)
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        return sendJson(res, 400, { error: 'ship_rejected', message: String(e.message || e) })
+      }
+      return sendJson(res, 201, { shipment_id: shipmentId, shipment_no: shipmentNo })
+    }
+    if (p === '/api/shipments' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const rows = db.prepare(`SELECT s.*, COALESCE(o.order_no, '') AS order_no FROM shipments s
+        LEFT JOIN outbound_orders o ON o.id = s.order_id ORDER BY s.id DESC`).all()
+      return sendJson(res, 200, { shipments: rows })
+    }
+    const shipmentIdMatch = /^\/api\/shipments\/(\d+)$/.exec(p)
+    if (shipmentIdMatch && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const shipment = db.prepare(`SELECT s.*, COALESCE(o.order_no, '') AS order_no FROM shipments s
+        LEFT JOIN outbound_orders o ON o.id = s.order_id WHERE s.id = ?`).get(Number(shipmentIdMatch[1]))
+      if (!shipment) return sendJson(res, 404, { error: 'shipment_not_found', message: 'Không tìm thấy phiếu giao' })
+      const items = db.prepare('SELECT * FROM shipment_items WHERE shipment_id = ? ORDER BY id').all(shipment.id)
+      return sendJson(res, 200, { shipment, items })
+    }
+    const shipmentReturns = /^\/api\/shipments\/(\d+)\/returns$/.exec(p)
+    if (shipmentReturns && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'returns_receive')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền returns_receive' })
+      const body = await readBody(req)
+      const shipment = db.prepare('SELECT * FROM shipments WHERE id = ?').get(Number(shipmentReturns[1]))
+      if (!shipment) return sendJson(res, 404, { error: 'shipment_not_found', message: 'Không tìm thấy phiếu giao' })
+      const inputs = (Array.isArray(body.lines) ? body.lines : []).filter((i) => Number(i.qty) > 0)
+      if (!inputs.length) return sendJson(res, 400, { error: 'invalid_return', message: 'Chưa nhập số lượng trả cho dòng nào' })
+      const order = db.prepare('SELECT * FROM outbound_orders WHERE id = ?').get(shipment.order_id)
+      let recvLoc
+      try { recvLoc = findReceivingLocation(order ? order.warehouse_id : null) } catch (e) {
+        return sendJson(res, 400, { error: 'no_receiving_location', message: String(e.message || e) })
+      }
+      const items = db.prepare('SELECT * FROM shipment_items WHERE shipment_id = ?').all(shipment.id)
+      for (const i of inputs) {
+        const item = items.find((x) => x.id === Number(i.shipment_item_id))
+        if (!item) return sendJson(res, 400, { error: 'invalid_return', message: `Dòng giao ${i.shipment_item_id} không thuộc phiếu giao này` })
+        if (r6(Number(i.qty)) > r6(item.qty - item.qty_returned) + EPS) {
+          return sendJson(res, 400, { error: 'invalid_return', message: `Trả vượt số đã giao còn lại của ${item.sku}` })
+        }
+      }
+      const at = nowStamp()
+      let returnId; let returnNo; const movements = []
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        db.prepare('UPDATE return_counter SET n = n + 1 WHERE id = 1').run()
+        const info = db.prepare(`INSERT INTO returns (return_no, shipment_id, order_id, customer_name, status, created_at, created_by)
+          VALUES ((SELECT 'TH-' || printf('%04d', n) FROM return_counter WHERE id = 1), ?, ?, ?, 'RECEIVED', ?, ?)`)
+          .run(shipment.id, shipment.order_id, order ? order.customer_name : null, at, s.username)
+        returnId = Number(info.lastInsertRowid)
+        returnNo = db.prepare('SELECT return_no FROM returns WHERE id = ?').get(returnId).return_no
+        const insLine = db.prepare(`INSERT INTO return_lines (return_id, shipment_item_id, sku, lot_id, qty_returned, reason)
+          VALUES (?, ?, ?, ?, ?, ?)`)
+        for (const i of inputs) {
+          const item = items.find((x) => x.id === Number(i.shipment_item_id))
+          let lotId = item.lot_id
+          if (lotId != null && !db.prepare('SELECT lot_id FROM lots WHERE lot_id = ?').get(lotId)) lotId = null
+          if (lotId == null) {
+            // Không rõ lô gốc -> sinh lô mới từ lot_counter để truy vết theo phiếu trả.
+            db.prepare('UPDATE lot_counter SET n = n + 1 WHERE id = 1').run()
+            const { n } = db.prepare('SELECT n FROM lot_counter WHERE id = 1').get()
+            lotId = n
+            db.prepare("INSERT INTO lots (lot_id, sku, status, location_id, created_at) VALUES (?, ?, 'INSPECT', ?, ?)")
+              .run(lotId, item.sku, recvLoc.id, at)
+          }
+          insLine.run(returnId, item.id, item.sku, lotId, Number(i.qty), i.reason ?? null)
+          db.prepare('UPDATE shipment_items SET qty_returned = qty_returned + ? WHERE id = ?').run(Number(i.qty), item.id)
+          item.qty_returned = r6(item.qty_returned + Number(i.qty))
+          movements.push({
+            type: 'RETURN_IN', sku: item.sku, lot_id: lotId, qty: Number(i.qty),
+            warehouse_id: order ? order.warehouse_id : null, location_id: recvLoc.id, into_inspect: true,
+            doc_type: 'RETURN', doc_id: returnId, doc_line_id: item.id,
+          })
+        }
+        db.exec('COMMIT')
+      } catch (e) {
+        db.exec('ROLLBACK')
+        return sendJson(res, 400, { error: 'return_rejected', message: String(e.message || e) })
+      }
+      try {
+        for (const m of movements) applyMovementTxn(m, s.username)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      return sendJson(res, 201, { return_id: returnId, return_no: returnNo })
+    }
+    const returnQc = /^\/api\/returns\/(\d+)\/qc$/.exec(p)
+    if (returnQc && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_receive')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_receive' })
+      const body = await readBody(req)
+      const ret = db.prepare('SELECT * FROM returns WHERE id = ?').get(Number(returnQc[1]))
+      if (!ret) return sendJson(res, 404, { error: 'return_not_found', message: 'Không tìm thấy phiếu trả' })
+      const line = db.prepare('SELECT * FROM return_lines WHERE id = ? AND return_id = ?').get(Number(body.return_line_id), ret.id)
+      if (!line) return sendJson(res, 404, { error: 'return_line_not_found', message: 'Không tìm thấy dòng hàng trả' })
+      const qtyPass = Number(body.qty_pass || 0); const qtyFail = Number(body.qty_fail || 0)
+      if (qtyPass + qtyFail <= 0) return sendJson(res, 400, { error: 'invalid_qc', message: 'Chưa nhập số lượng QC' })
+      if (r6(qtyPass + qtyFail) > retPendingQcS(line) + EPS) {
+        return sendJson(res, 400, { error: 'invalid_qc', message: `QC vượt số đang chờ (${retPendingQcS(line)})` })
+      }
+      if (qtyFail > 0 && !body.reason_code) {
+        return sendJson(res, 400, { error: 'invalid_qc', message: 'Có hàng hỏng khi QC: bắt buộc chọn lý do' })
+      }
+      const order = ret.order_id != null ? db.prepare('SELECT * FROM outbound_orders WHERE id = ?').get(ret.order_id) : null
+      try {
+        if (qtyFail > 0) {
+          const recvLoc = findReceivingLocation(order ? order.warehouse_id : null)
+          applyMovementTxn({
+            type: 'DAMAGE', sku: line.sku, lot_id: line.lot_id, qty: qtyFail,
+            warehouse_id: order ? order.warehouse_id : null, location_id: recvLoc.id, from_inspect: true,
+            reason_code: String(body.reason_code), doc_type: 'RETURN', doc_id: ret.id, doc_line_id: line.id,
+          }, s.username)
+        }
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      const newPass = r6(line.qty_qc_pass + qtyPass); const newFail = r6(line.qty_qc_fail + qtyFail)
+      const done = r6(newPass + newFail) + EPS >= line.qty_returned
+      const qcStatus = !done ? 'PARTIAL' : (newFail === 0 ? 'PASS' : (newPass === 0 ? 'FAIL' : 'PARTIAL'))
+      db.prepare(`UPDATE return_lines SET qty_qc_pass = ?, qty_qc_fail = ?, qc_status = ?,
+        damage_reason_code = COALESCE(?, damage_reason_code) WHERE id = ?`)
+        .run(newPass, newFail, qcStatus, qtyFail > 0 ? String(body.reason_code) : null, line.id)
+      refreshReturnS(ret.id, line.id)
+      return sendJson(res, 200, { return_line_id: line.id, qc_status: qcStatus })
+    }
+    const returnPutaway = /^\/api\/returns\/(\d+)\/putaway$/.exec(p)
+    if (returnPutaway && req.method === 'POST') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_putaway')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_putaway' })
+      const body = await readBody(req)
+      const ret = db.prepare('SELECT * FROM returns WHERE id = ?').get(Number(returnPutaway[1]))
+      if (!ret) return sendJson(res, 404, { error: 'return_not_found', message: 'Không tìm thấy phiếu trả' })
+      const line = db.prepare('SELECT * FROM return_lines WHERE id = ? AND return_id = ?').get(Number(body.return_line_id), ret.id)
+      if (!line) return sendJson(res, 404, { error: 'return_line_not_found', message: 'Không tìm thấy dòng hàng trả' })
+      const qty = Number(body.qty || 0)
+      if (qty <= 0 || r6(qty) > retAwaitingPutawayS(line) + EPS) {
+        return sendJson(res, 400, { error: 'invalid_putaway', message: `Số cất phải > 0 và không vượt số chờ cất (${retAwaitingPutawayS(line)})` })
+      }
+      const dest = db.prepare('SELECT * FROM locations WHERE id = ?').get(Number(body.to_location_id))
+      if (!dest || dest.active !== 1) return sendJson(res, 400, { error: 'invalid_putaway', message: 'Vị trí đích không tồn tại hoặc đang tắt' })
+      if (NEVER_PUTAWAY_TYPES.has(dest.loc_type)) {
+        return sendJson(res, 400, { error: 'invalid_putaway', message: `Không cất hàng vào vị trí loại ${dest.loc_type}` })
+      }
+      const order = ret.order_id != null ? db.prepare('SELECT * FROM outbound_orders WHERE id = ?').get(ret.order_id) : null
+      let recvLoc
+      try { recvLoc = findReceivingLocation(order ? order.warehouse_id : null) } catch (e) {
+        return sendJson(res, 400, { error: 'no_receiving_location', message: String(e.message || e) })
+      }
+      if (dest.id === recvLoc.id) return sendJson(res, 400, { error: 'invalid_putaway', message: 'Vị trí đích trùng vị trí nhận hàng' })
+      try {
+        applyMovementTxn({
+          type: 'PUTAWAY', sku: line.sku, lot_id: line.lot_id, qty,
+          warehouse_id: order ? order.warehouse_id : null, from_location_id: recvLoc.id, location_id: dest.id,
+          doc_type: 'RETURN', doc_id: ret.id, doc_line_id: line.id,
+        }, s.username)
+      } catch (e) {
+        return sendJson(res, 400, { error: 'movement_rejected', message: String(e.message || e) })
+      }
+      db.prepare('UPDATE return_lines SET qty_putaway = ? WHERE id = ?').run(r6(line.qty_putaway + qty), line.id)
+      if (line.lot_id != null) db.prepare('UPDATE lots SET location_id = ? WHERE lot_id = ?').run(dest.id, line.lot_id)
+      refreshReturnS(ret.id, line.id)
+      return sendJson(res, 200, { return_line_id: line.id, qty_putaway: r6(line.qty_putaway + qty) })
+    }
+    if (p === '/api/returns' && req.method === 'GET') {
+      const s = requireAuth(req, res); if (!s) return
+      if (!requireDevice(req, res)) return
+      if (!can(s.role, 'inventory_view')) return sendJson(res, 403, { error: 'forbidden', message: 'Thiếu quyền inventory_view' })
+      const rows = db.prepare('SELECT * FROM returns ORDER BY id DESC').all()
+        .map((r) => ({ ...r, lines: db.prepare('SELECT * FROM return_lines WHERE return_id = ? ORDER BY id').all(r.id) }))
+      return sendJson(res, 200, { returns: rows })
     }
 
     if (p.startsWith('/api/') || p.startsWith('/federation/')) {

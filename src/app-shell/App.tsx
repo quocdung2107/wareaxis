@@ -20,6 +20,7 @@ const TOOLS: { group: string; path: string; title: string; hint: string; icon: I
   { group: 'Kiểm đếm', path: 'kiem-kho', title: 'Kiểm kho', hint: 'Phiếu kiểm A4 theo dãy kệ, xem trên điện thoại', icon: 'clipboard', page: lazy(() => import('../features/inventory-check/InventoryCheckPage.tsx')) },
   { group: 'Kiểm đếm', path: 'tra-sku', title: 'Tra SKU', hint: 'Gõ SKU, xem mọi vị trí, lô, ngày, tình trạng', icon: 'search', page: lazy(() => import('../features/sku-lookup/SkuLookupPage.tsx')) },
   { group: 'Lấy hàng', path: 'don-picking', title: 'Lệnh lấy hàng', hint: 'Tạo lệnh PK, lấy hàng theo đơn, theo dõi tiến độ', icon: 'receipt', page: lazy(() => import('../features/pick-orders/PickOrdersPage.tsx')) },
+  { group: 'Lấy hàng', path: 'outbound', title: 'Xuất kho', hint: 'Đơn xuất -> phân bổ FEFO -> wave lấy hàng -> đóng gói -> giao -> trả hàng (hàng theo lô)', icon: 'truck', page: lazy(() => import('../features/outbound/OutboundPage.tsx')) },
   { group: 'In ấn & file', path: 'barcode', title: 'Barcode / QR', hint: 'Mã Code128 và QR, in hàng loạt', icon: 'barcode', page: lazy(() => import('../features/barcode/BarcodePage.tsx')) },
   { group: 'In ấn & file', path: 'label', title: 'Label Maker', hint: 'Giấy đánh dấu pallet, vị trí, lô trên A4', icon: 'tag', page: lazy(() => import('../features/label-maker/LabelMakerPage.tsx')) },
   { group: 'In ấn & file', path: 'excel', title: 'Excel Formatter', hint: 'Lọc, sắp xếp, đổi tên, nhóm, tách, gộp cột', icon: 'chart', page: lazy(() => import('../features/excel-formatter/ExcelFormatterPage.tsx')) },

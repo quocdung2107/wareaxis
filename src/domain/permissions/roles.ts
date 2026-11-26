@@ -31,6 +31,11 @@ export const PERMISSIONS = [
   'inventory_transfer', // chuyển vị trí / chuyển kho
   'purchase_create', // tạo đơn mua PO / phiếu nhập dự kiến
   'purchase_receive', // nhận hàng theo PO + QC (GĐ1)
+  'outbound_allocate', // tạo đơn xuất + phân bổ tồn + huỷ đơn (GĐ2)
+  'outbound_pick', // tạo wave + xác nhận lấy hàng (GĐ2)
+  'outbound_pack', // đóng gói kiểm chứng (GĐ2)
+  'outbound_ship', // giao hàng / tạo phiếu giao (GĐ2)
+  'returns_receive', // nhận hàng khách trả về (GĐ2)
   'reports_view', // xem báo cáo / thẻ kho
   'users_manage', // quản lý tài khoản local
   'devices_manage', // duyệt / thu hồi thiết bị
@@ -48,10 +53,12 @@ export const ROLE_PERMISSIONS: Record<LocalRole, readonly Permission[]> = {
   THU_KHO: [
     'inventory_view', 'inventory_receive', 'inventory_putaway', 'inventory_pick',
     'inventory_count', 'inventory_adjust', 'inventory_transfer',
-    'purchase_create', 'purchase_receive', 'reports_view',
+    'purchase_create', 'purchase_receive',
+    'outbound_allocate', 'outbound_pick', 'outbound_pack', 'outbound_ship', 'returns_receive',
+    'reports_view',
   ],
-  NV_LAY_HANG: ['inventory_view', 'inventory_pick'],
-  NV_NHAN_HANG: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'purchase_receive'],
+  NV_LAY_HANG: ['inventory_view', 'inventory_pick', 'outbound_pick', 'outbound_pack'],
+  NV_NHAN_HANG: ['inventory_view', 'inventory_receive', 'inventory_putaway', 'purchase_receive', 'returns_receive'],
   KE_TOAN_XEM: ['inventory_view', 'reports_view'],
 }
 

@@ -183,6 +183,91 @@ try {
   assert.equal(fedGd1.json.total_available, 7)
   console.log('✓ GĐ1 putaway: đích on_hand=7 khả dụng=7, lô AVAILABLE, federation thấy SKU mới')
 
+  // --- GĐ2: đơn xuất 5 -> phân bổ -> wave -> pick -> pack -> ship -> trả 2 về lô gốc -> QC -> putaway ---
+  const ob = await call('POST', '/api/outbound-orders', {
+    token, device,
+    body: { customer_name: 'Khách khói', lines: [{ sku: 'GD1-1', qty_ordered: 5 }] },
+  })
+  assert.equal(ob.status, 201, JSON.stringify(ob.json))
+  assert.match(ob.json.order_no, /^XH-\d{4}$/)
+  const obId = ob.json.id
+
+  const allocRes = await call('POST', `/api/outbound-orders/${obId}/allocate`, { token, device, body: {} })
+  assert.equal(allocRes.status, 200, JSON.stringify(allocRes.json))
+  assert.equal(allocRes.json.status, 'ALLOCATED')
+  assert.equal(allocRes.json.results[0].qty_allocated, 5)
+  const balGd1 = async () => (await call('GET', '/api/inventory/balances?sku=GD1-1', { token, device })).json.balances
+  let atPick2 = (await balGd1()).find((b) => b.location_id === pickLoc.id)
+  assert.deepEqual([atPick2.on_hand, atPick2.allocated, atPick2.available], [7, 5, 2])
+  console.log('✓ GĐ2 phân bổ: giữ 5 tại A01-01, khả dụng còn 2')
+
+  const wave = await call('POST', '/api/waves', { token, device, body: { order_ids: [obId], carrier_text: 'Xe khói' } })
+  assert.equal(wave.status, 201, JSON.stringify(wave.json))
+  assert.match(wave.json.wave_no, /^WV-\d{4}$/)
+  const waveTasks = await call('GET', `/api/waves/${wave.json.wave_id}/tasks`, { token, device })
+  assert.equal(waveTasks.json.tasks.length, 1)
+  assert.equal(waveTasks.json.tasks[0].qty_need, 5)
+  const taskId = waveTasks.json.tasks[0].id
+
+  const pickConfirm = await call('POST', `/api/pick-tasks/${taskId}/confirm`, { token, device, body: { qty: 5 } })
+  assert.equal(pickConfirm.status, 200, JSON.stringify(pickConfirm.json))
+  assert.equal(pickConfirm.json.status, 'PICKED')
+  atPick2 = (await balGd1()).find((b) => b.location_id === pickLoc.id)
+  assert.deepEqual([atPick2.on_hand, atPick2.allocated, atPick2.available], [2, 0, 2])
+  console.log('✓ GĐ2 wave + pick: lấy đủ 5, tồn A01-01 còn 2')
+
+  const packWrong = await call('POST', `/api/outbound-orders/${obId}/pack`, {
+    token, device, body: { scans: [{ sku: 'SAI-1', qty: 1 }] },
+  })
+  assert.equal(packWrong.status, 400)
+  const packOk = await call('POST', `/api/outbound-orders/${obId}/pack`, {
+    token, device, body: { scans: [{ sku: 'GD1-1', qty: 5 }] },
+  })
+  assert.equal(packOk.status, 200, JSON.stringify(packOk.json))
+  assert.equal(packOk.json.complete, true)
+  console.log('✓ GĐ2 pack: sai SKU bị chặn, đúng SKU đủ -> PACKED')
+
+  const ship = await call('POST', `/api/outbound-orders/${obId}/ship`, {
+    token, device, body: { carrier_text: 'Xe khói', tracking_text: 'VD-SMOKE-1' },
+  })
+  assert.equal(ship.status, 201, JSON.stringify(ship.json))
+  assert.match(ship.json.shipment_no, /^GH-\d{4}$/)
+  const obAfter = await call('GET', `/api/outbound-orders/${obId}`, { token, device })
+  assert.equal(obAfter.json.order.status, 'COMPLETED')
+  const shipFull = await call('GET', `/api/shipments/${ship.json.shipment_id}`, { token, device })
+  assert.equal(shipFull.json.items.length, 1)
+  assert.equal(shipFull.json.items[0].qty, 5)
+  assert.equal(shipFull.json.items[0].lot_id, rl.lot_id) // truy vết đúng lô GĐ1
+  atPick2 = (await balGd1()).find((b) => b.location_id === pickLoc.id)
+  assert.equal(atPick2.available, 2)
+  console.log('✓ GĐ2 ship: phiếu giao kèm lô gốc, đơn COMPLETED, khả dụng vẫn 2')
+
+  const ret = await call('POST', `/api/shipments/${ship.json.shipment_id}/returns`, {
+    token, device, body: { lines: [{ shipment_item_id: shipFull.json.items[0].id, qty: 2, reason: 'Khách đổi ý' }] },
+  })
+  assert.equal(ret.status, 201, JSON.stringify(ret.json))
+  assert.match(ret.json.return_no, /^TH-\d{4}$/)
+  let atRecv2 = (await balGd1()).find((b) => b.location_id === recvLoc.id)
+  assert.deepEqual([atRecv2.on_hand, atRecv2.inspect, atRecv2.damaged], [3, 2, 1])
+  console.log('✓ GĐ2 trả hàng: 2 về xô inspect tại khu nhận, đúng lô gốc')
+
+  const rets = await call('GET', '/api/returns', { token, device })
+  const retLine = rets.json.returns[0].lines[0]
+  assert.equal(retLine.lot_id, rl.lot_id)
+  const retQc = await call('POST', `/api/returns/${ret.json.return_id}/qc`, {
+    token, device, body: { return_line_id: retLine.id, qty_pass: 2, qty_fail: 0 },
+  })
+  assert.equal(retQc.status, 200, JSON.stringify(retQc.json))
+  const retPut = await call('POST', `/api/returns/${ret.json.return_id}/putaway`, {
+    token, device, body: { return_line_id: retLine.id, qty: 2, to_location_id: pickLoc.id },
+  })
+  assert.equal(retPut.status, 200, JSON.stringify(retPut.json))
+  atPick2 = (await balGd1()).find((b) => b.location_id === pickLoc.id)
+  assert.deepEqual([atPick2.on_hand, atPick2.available], [4, 4])
+  const retsAfter = await call('GET', '/api/returns', { token, device })
+  assert.equal(retsAfter.json.returns[0].status, 'DONE')
+  console.log('✓ GĐ2 QC + putaway hàng trả: khả dụng A01-01 = 4, phiếu trả DONE')
+
   const backup = await call('POST', '/api/admin/backup', { token })
   assert.equal(backup.status, 200)
   assert.ok(fs.existsSync(path.join(tmp, 'backups', backup.json.file)), 'file backup phải tồn tại')
