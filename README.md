@@ -198,6 +198,36 @@ sổ cái kèm người thực hiện + lý do bắt buộc cho điều chỉnh/
    phía server), POS tại quầy và đơn vị chứa pallet (chỉ làm khi vận hành
    thật cần).
 
+## Lớp trung gian giao tiếp (Bản A — T0/T1)
+
+Lớp chia sẻ mới trên Supabase (tách hẳn khỏi tồn kho localhost): kho/chủ hàng và nhà xe
+tự tìm thấy nhau, chốt chuyến và ghi lại quá trình giao nhận. Triết lý Bản A: hệ thống
+chỉ là công cụ giao tiếp và ghi nhận — **không duyệt/xác thực đơn vị, không chặn theo
+hạn giấy tờ** (hạn giấy tờ chỉ hiển thị), hồ sơ là **thông tin do đơn vị tự khai — các
+bên tự xác minh khi giao dịch**, không phân xử tranh chấp, không xử lý thanh toán.
+
+Đã có trong code (T0+T1):
+
+- Migration `supabase/migrations/20261127000000_freight_t1_foundation.sql`: 10 bảng
+  `freight_*` (hồ sơ tổ chức/kho/xe/tài xế/tuyến, kết nối mạng lưới, tải đăng, chuyến,
+  sự kiện chuyến), RLS theo group/vai trò, view rút gọn `freight_loads_public`, và các
+  RPC `freight_create_load`, `freight_assign_booking` (chỉ định nhà xe), 
+  `freight_respond_booking`, `freight_advance_booking`, `freight_cancel_*`,
+  `freight_assign_vehicle_driver`. Chỉ tạo mới đối tượng `freight_*`, không sửa bảng cũ;
+  trạng thái chuyến ánh xạ một chiều sang 6 trạng thái đơn cũ qua lớp đồng bộ bọc lỗi.
+- Domain thuần `src/domain/freight/` (máy trạng thái Load/Booking, ánh xạ sang đơn cũ,
+  validate mềm hồ sơ tự khai) + test `tests/freight.test.ts`.
+- Màn hình **Vận tải** (Kho → Hệ thống): hồ sơ đơn vị tự khai + xe/tài xế/tuyến + kết nối
+  mạng lưới; đăng tải tìm xe (từ đơn có sẵn hoặc độc lập, 3 mức hiển thị
+  DIRECT/NETWORK/PUBLIC) và chỉ định nhà xe; quản lý chuyến theo phía kèm dòng sự kiện.
+  Trang **Điều khoản sử dụng** tối thiểu (Kho → Hệ thống), phiên bản v1.
+
+**Trạng thái: code + migration đã sẵn sàng, CHƯA áp lên Supabase thật.** Muốn bật tính
+năng: export schema thật để đối chiếu giả định rồi áp migration qua Dashboard SQL
+Editor theo tài liệu hướng dẫn T0/T1 đi kèm dự án (thư mục tài liệu
+`wms-nang-cap/huong-dan-t0-t1-supabase.md`). Chưa làm: T2 chào giá, T3 POD + link theo
+dõi + ghi nhận cước, T4 đánh giá + GPS mức 2.
+
 ## Triển khai lên GitHub Pages
 
 Địa chỉ app: `https://quocdung2107.github.io/wms/`

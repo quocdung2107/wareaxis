@@ -32,6 +32,8 @@ const TOOLS: { group: string; path: string; title: string; hint: string; icon: I
   { group: 'Dữ liệu', path: 'dvt', title: 'Đơn vị tính', hint: 'Gom CAI / CÁI / Cái về một tên', icon: 'scale', page: lazy(() => import('../features/settings/UomPage.tsx')) },
   { group: 'Hệ thống', path: 'federation', title: 'Liên kho', hint: 'Khoá liên kho + chính sách chia sẻ + cổng tra tồn của nhiều kho (chỉ đọc, qua VPN)', icon: 'users', page: lazy(() => import('../features/federation/FederationPage.tsx')) },
   { group: 'Kiểm đếm', path: 'reports', title: 'Báo cáo', hint: 'Thẻ kho theo lô, nhập–xuất–tồn, định giá tồn, đối chiếu MISA, nhật ký biến động (cần quyền reports_view)', icon: 'chart', page: lazy(() => import('../features/reports/ReportsPage.tsx')) },
+  { group: 'Hệ thống', path: 'freight', title: 'Vận tải', hint: 'Tìm xe & chốt chuyến giữa kho và nhà xe: hồ sơ tự khai, đăng tải, chỉ định nhà xe, theo dõi chuyến (lớp trung gian giao tiếp, cần Supabase)', icon: 'truck', page: lazy(() => import('../features/freight/FreightPage.tsx')) },
+  { group: 'Hệ thống', path: 'dieu-khoan', title: 'Điều khoản sử dụng', hint: 'Điều khoản tối thiểu của lớp trung gian giao tiếp Kho ↔ Vận tải (tự khai — tự xác minh — tự chịu trách nhiệm)', icon: 'clipboard', page: lazy(() => import('../features/legal/TermsPage.tsx')) },
 ]
 
 const GROUPS = ['Dữ liệu', 'Kiểm đếm', 'Lấy hàng', 'In ấn & file', 'Hệ thống']
