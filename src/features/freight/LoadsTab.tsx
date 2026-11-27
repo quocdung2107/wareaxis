@@ -124,8 +124,8 @@ function CreateLoadForm({
     setGoods(o.goods)
     setWeight(o.weight_kg ? String(o.weight_kg) : '')
     setPackages(o.packages ? String(o.packages) : '')
-    setPickupAddress(o.pickup_address)
-    setDeliveryAddress(o.delivery_address)
+    setPickupAddress(o.pickup_address ?? '')
+    setDeliveryAddress(o.delivery_address ?? '')
   }
 
   async function submit() {

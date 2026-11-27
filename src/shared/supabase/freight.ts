@@ -421,23 +421,42 @@ export interface GroupOrderLite {
   goods: string
   status: string
   shipment_code: string | null
-  pickup_address: string
-  delivery_address: string
-  weight_kg: number
-  packages: number
+  pickup_address: string | null
+  delivery_address: string | null
+  weight_kg: number | null
+  packages: number | null
 }
 
-/** Đơn của nhóm để tạo tải từ đơn có sẵn (điểm chạm Bản A mục 3.6). */
+/**
+ * Đơn của nhóm để tạo tải từ đơn có sẵn (điểm chạm Bản A mục 3.6).
+ * Đọc qua orders_view như mọi màn hình Orders khác: bảng orders thật
+ * (đối chiếu export 2026-11-27) KHÔNG có các cột shipment_code /
+ * địa chỉ / cân nặng — các trường đó (nếu view có) được lấy phòng thủ
+ * bằng select('*'), thiếu thì để null cho người dùng tự điền vào tải.
+ */
 export async function listGroupOrders(groupId: string): Promise<GroupOrderLite[]> {
-  return query<GroupOrderLite[]>(() =>
+  const rows = await query<Record<string, unknown>[]>(() =>
     sb()
-      .from('orders')
-      .select('id,code,goods,status,shipment_code,pickup_address,delivery_address,weight_kg,packages')
+      .from('orders_view')
+      .select('*')
       .eq('group_id', groupId)
       .neq('status', 'COMPLETED')
-      .order('created_at', { ascending: false })
+      .order('last_activity_at', { ascending: false })
       .limit(100),
   )
+  const str = (v: unknown): string | null => (typeof v === 'string' && v ? v : null)
+  const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+  return rows.map((r) => ({
+    id: String(r.id),
+    code: String(r.code ?? ''),
+    goods: String(r.goods ?? ''),
+    status: String(r.status ?? ''),
+    shipment_code: str(r.shipment_code),
+    pickup_address: str(r.pickup_address),
+    delivery_address: str(r.delivery_address),
+    weight_kg: num(r.weight_kg),
+    packages: num(r.packages),
+  }))
 }
 
 export interface CreateLoadInput {

@@ -37,12 +37,18 @@
 --       client đọc cột `roles` dạng mảng (features/orders/GroupView.tsx,
 --       types.ts Member{roles: string[]}); mã vai trò: 'admin',
 --       'coordinator', 'operator', 'driver', 'viewer'.
---   [*] orders(id uuid PK, group_id uuid, code text, status text,
---       completed_at timestamptz NULL) với status thuộc vòng đời
---       CREATED/CONFIRMED/PICKING/IN_TRANSIT/DELIVERED/COMPLETED.
---   [*] order_events(order_id uuid, actor_id uuid, type text,
+--   [✓ ĐÃ ĐỐI CHIẾU export schema thật 2026-11-27] orders(id uuid PK,
+--       group_id uuid, code text, goods text, status text,
+--       assignee_id uuid NULL, issue_open boolean, created_by uuid,
+--       created_at, updated_at, last_activity_at) với status thuộc vòng
+--       đời CREATED/CONFIRMED/PICKING/IN_TRANSIT/DELIVERED/COMPLETED.
+--       LƯU Ý: bảng orders KHÔNG có cột completed_at (completed_at chỉ
+--       có ở orders_view, dạng tính toán) — khối đồng bộ bên dưới chỉ
+--       UPDATE status/updated_at, tuyệt đối không set completed_at.
+--   [✓ ĐÃ ĐỐI CHIẾU] order_events(id bigint PK, order_id uuid,
+--       group_id uuid NOT NULL, actor_id uuid, type text,
 --       from_status text, to_status text, note text, created_at) —
---       suy ra từ features/orders/types.ts OrderEvent.
+--       group_id là NOT NULL nên mọi INSERT phải kèm group_id của đơn.
 --   [*] RPC complete_order(p_order uuid, p_note text) tồn tại — chỉ gọi
 --       khi kiểm tra thấy có trong pg_proc, lỗi thì fallback UPDATE.
 --   [*] auth.uid() dùng được trong RLS/RPC (Supabase Auth chuẩn).
@@ -734,12 +740,13 @@ DECLARE
     ELSE NULL
   END;
   v_cur text;
+  v_group uuid;
 BEGIN
   IF p_order_id IS NULL OR v_target IS NULL THEN
     RETURN;
   END IF;
   BEGIN
-    SELECT o.status INTO v_cur FROM public.orders o WHERE o.id = p_order_id;
+    SELECT o.status, o.group_id INTO v_cur, v_group FROM public.orders o WHERE o.id = p_order_id;
     IF v_cur IS NULL THEN
       RETURN;
     END IF;
@@ -754,14 +761,17 @@ BEGIN
       BEGIN
         PERFORM public.complete_order(p_order_id, 'Đồng bộ từ chuyến ' || p_booking_code);
       EXCEPTION WHEN OTHERS THEN
-        UPDATE public.orders SET status = 'COMPLETED', completed_at = now()
+        -- orders KHÔNG có completed_at (đã đối chiếu schema thật
+        -- 2026-11-27) — chỉ set status + updated_at.
+        UPDATE public.orders SET status = 'COMPLETED', updated_at = now()
         WHERE id = p_order_id AND status = v_cur;
       END;
     ELSE
-      UPDATE public.orders SET status = v_target WHERE id = p_order_id AND status = v_cur;
+      UPDATE public.orders SET status = v_target, updated_at = now() WHERE id = p_order_id AND status = v_cur;
       IF FOUND THEN
-        INSERT INTO public.order_events (order_id, actor_id, type, from_status, to_status, note)
-        VALUES (p_order_id, auth.uid(), 'freight_status', v_cur, v_target, 'Đồng bộ từ chuyến ' || p_booking_code);
+        -- order_events.group_id là NOT NULL trong schema thật.
+        INSERT INTO public.order_events (order_id, group_id, actor_id, type, from_status, to_status, note)
+        VALUES (p_order_id, v_group, auth.uid(), 'freight_status', v_cur, v_target, 'Đồng bộ từ chuyến ' || p_booking_code);
       END IF;
     END IF;
   EXCEPTION WHEN OTHERS THEN
