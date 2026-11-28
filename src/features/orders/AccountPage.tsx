@@ -15,16 +15,20 @@ export default function AccountPage() {
 
 function Account({ userId, email }: { userId: string; email: string }) {
   const profile = useLoad(async () => {
-    const { data, error } = await supabase!.from('profiles').select('display_name').eq('id', userId).single()
+    // maybeSingle: tài khoản tạo trước khi profiles bị xoá dữ liệu (wipe)
+    // có thể CHƯA có dòng profiles — đó không phải lỗi, chỉ là chưa đặt tên.
+    const { data, error } = await supabase!.from('profiles').select('display_name').eq('id', userId).maybeSingle()
     if (error) throw error
-    return data.display_name as string
+    return (data?.display_name as string | undefined) ?? ''
   }, [userId])
   const [name, setName] = useState<string | null>(null)
   const [msg, setMsg] = useState('')
   const shown = name ?? profile.data ?? ''
 
   async function save() {
-    const { error } = await supabase!.from('profiles').update({ display_name: shown.trim() }).eq('id', userId)
+    // upsert: tạo dòng profiles nếu chưa có (update thuần sẽ im lặng
+    // không làm gì khi dòng chưa tồn tại).
+    const { error } = await supabase!.from('profiles').upsert({ id: userId, display_name: shown.trim() })
     setMsg(error ? 'Không lưu được tên.' : 'Đã lưu.')
   }
 
