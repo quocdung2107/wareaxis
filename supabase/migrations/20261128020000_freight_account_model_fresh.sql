@@ -607,6 +607,15 @@ $$;
 -- ---------------------------------------------------------------------
 -- 5. RLS — đọc theo quan hệ giao dịch; ghi nhạy cảm chỉ qua RPC;
 -- ghi danh mục của chính mình qua RLS.
+--
+-- QUY TẮC CHỐNG ĐỆ QUY RLS (bài học 2026-11-28): biểu thức policy
+-- KHÔNG ĐƯỢC chứa subquery trần (EXISTS SELECT...) chạm sang bảng
+-- freight_* khác — Postgres đánh giá policy của bảng bị chạm tới và
+-- hai bảng tham chiếu lẫn nhau (bookings ⇄ drivers) sẽ gây lỗi
+-- 42P17 "infinite recursion detected in policy" cho MỌI truy vấn
+-- authenticated (anon không dính vì không có policy áp cho anon).
+-- Mọi kiểm tra xuyên bảng PHẢI qua helper SECURITY DEFINER dưới đây
+-- (chạy quyền owner, bỏ qua RLS của bảng bên trong → cắt vòng lặp).
 -- ---------------------------------------------------------------------
 
 ALTER TABLE public.freight_account_profiles ENABLE ROW LEVEL SECURITY;
@@ -619,6 +628,128 @@ ALTER TABLE public.freight_loads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.freight_bookings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.freight_booking_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.freight_load_groups ENABLE ROW LEVEL SECURITY;
+
+-- ----- Helper SECURITY DEFINER cho policy (cắt đệ quy RLS) -----
+
+/** auth.uid() có là tài xế ĐANG HOẠT ĐỘNG liên kết với nhà xe này không. */
+CREATE OR REPLACE FUNCTION public.freight_acct_driver_linked_to(p_carrier_account_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_my_drivers d
+    WHERE d.user_id = auth.uid() AND d.account_id = p_carrier_account_id AND d.active
+  );
+$$;
+
+/** auth.uid() thấy được booking này không (một phía hoặc tài xế liên kết). */
+CREATE OR REPLACE FUNCTION public.freight_acct_booking_visible(p_booking_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_bookings b
+    WHERE b.id = p_booking_id
+      AND (b.shipper_account_id = auth.uid() OR b.carrier_account_id = auth.uid()
+        OR public.freight_acct_driver_linked_to(b.carrier_account_id))
+  );
+$$;
+
+/** Trên tải này có booking mà auth.uid() là một phía không. */
+CREATE OR REPLACE FUNCTION public.freight_acct_load_has_my_booking(p_load_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_bookings b
+    WHERE b.load_id = p_load_id
+      AND (b.shipper_account_id = auth.uid() OR b.carrier_account_id = auth.uid())
+  );
+$$;
+
+/** Xe này có nằm trong booking mà auth.uid() là chủ hàng không. */
+CREATE OR REPLACE FUNCTION public.freight_acct_vehicle_in_my_booking(p_vehicle_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_bookings b
+    WHERE b.my_vehicle_id = p_vehicle_id AND b.shipper_account_id = auth.uid()
+  );
+$$;
+
+/** Tài xế này có nằm trong booking mà auth.uid() là chủ hàng không. */
+CREATE OR REPLACE FUNCTION public.freight_acct_driver_in_my_booking(p_driver_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_bookings b
+    WHERE b.my_driver_id = p_driver_id AND b.shipper_account_id = auth.uid()
+  );
+$$;
+
+/** Kho này có là điểm lấy của một booking ĐANG SỐNG mà auth.uid() là nhà xe không. */
+CREATE OR REPLACE FUNCTION public.freight_acct_warehouse_pickup_for_me(p_warehouse_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_loads l
+    JOIN public.freight_bookings b ON b.load_id = l.id
+    WHERE l.pickup_point_id = p_warehouse_id
+      AND b.carrier_account_id = auth.uid()
+      AND b.status NOT IN ('CANCELLED', 'DECLINED')
+  );
+$$;
+
+/** Xe này có được ĐỀ XUẤT trong bid cho một tải của auth.uid() không. */
+CREATE OR REPLACE FUNCTION public.freight_acct_vehicle_proposed_to_me(p_vehicle_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_bids b
+    JOIN public.freight_loads l ON l.id = b.load_id
+    WHERE b.proposed_vehicle_id = p_vehicle_id AND l.poster_account_id = auth.uid()
+  );
+$$;
+
+/** Tài xế này có được ĐỀ XUẤT trong bid cho một tải của auth.uid() không. */
+CREATE OR REPLACE FUNCTION public.freight_acct_driver_proposed_to_me(p_driver_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_bids b
+    JOIN public.freight_loads l ON l.id = b.load_id
+    WHERE b.proposed_driver_id = p_driver_id AND l.poster_account_id = auth.uid()
+  );
+$$;
 
 -- Hồ sơ tài khoản: mọi người đã đăng nhập đọc được (thư mục đối tác —
 -- thông tin tự khai để hai bên liên lạc, luôn hiển thị kèm nhãn tự khai
@@ -633,13 +764,7 @@ DROP POLICY IF EXISTS freight_my_warehouses_select ON public.freight_my_warehous
 CREATE POLICY freight_my_warehouses_select ON public.freight_my_warehouses
   FOR SELECT TO authenticated USING (
     account_id = auth.uid()
-    OR EXISTS (
-      SELECT 1 FROM public.freight_loads l
-      JOIN public.freight_bookings b ON b.load_id = l.id
-      WHERE l.pickup_point_id = freight_my_warehouses.id
-        AND b.carrier_account_id = auth.uid()
-        AND b.status NOT IN ('CANCELLED', 'DECLINED')
-    )
+    OR public.freight_acct_warehouse_pickup_for_me(freight_my_warehouses.id)
   );
 DROP POLICY IF EXISTS freight_my_warehouses_insert ON public.freight_my_warehouses;
 CREATE POLICY freight_my_warehouses_insert ON public.freight_my_warehouses
@@ -657,10 +782,7 @@ DROP POLICY IF EXISTS freight_my_vehicles_select ON public.freight_my_vehicles;
 CREATE POLICY freight_my_vehicles_select ON public.freight_my_vehicles
   FOR SELECT TO authenticated USING (
     account_id = auth.uid()
-    OR EXISTS (
-      SELECT 1 FROM public.freight_bookings b
-      WHERE b.my_vehicle_id = freight_my_vehicles.id AND b.shipper_account_id = auth.uid()
-    )
+    OR public.freight_acct_vehicle_in_my_booking(freight_my_vehicles.id)
   );
 DROP POLICY IF EXISTS freight_my_vehicles_insert ON public.freight_my_vehicles;
 CREATE POLICY freight_my_vehicles_insert ON public.freight_my_vehicles
@@ -679,10 +801,7 @@ CREATE POLICY freight_my_drivers_select ON public.freight_my_drivers
   FOR SELECT TO authenticated USING (
     account_id = auth.uid()
     OR user_id = auth.uid()
-    OR EXISTS (
-      SELECT 1 FROM public.freight_bookings b
-      WHERE b.my_driver_id = freight_my_drivers.id AND b.shipper_account_id = auth.uid()
-    )
+    OR public.freight_acct_driver_in_my_booking(freight_my_drivers.id)
   );
 DROP POLICY IF EXISTS freight_my_drivers_insert ON public.freight_my_drivers;
 CREATE POLICY freight_my_drivers_insert ON public.freight_my_drivers
@@ -736,11 +855,7 @@ CREATE POLICY freight_loads_select_acct ON public.freight_loads
   FOR SELECT TO authenticated USING (
     poster_account_id = auth.uid()
     OR directed_account_id = auth.uid()
-    OR EXISTS (
-      SELECT 1 FROM public.freight_bookings b
-      WHERE b.load_id = freight_loads.id
-        AND (b.shipper_account_id = auth.uid() OR b.carrier_account_id = auth.uid())
-    )
+    OR public.freight_acct_load_has_my_booking(freight_loads.id)
     OR EXISTS (
       SELECT 1 FROM public.freight_load_groups lg
       WHERE lg.load_id = freight_loads.id AND public.freight_is_group_member(lg.group_id)
@@ -754,10 +869,7 @@ CREATE POLICY freight_bookings_select_acct ON public.freight_bookings
   FOR SELECT TO authenticated USING (
     shipper_account_id = auth.uid()
     OR carrier_account_id = auth.uid()
-    OR EXISTS (
-      SELECT 1 FROM public.freight_my_drivers d
-      WHERE d.user_id = auth.uid() AND d.account_id = freight_bookings.carrier_account_id AND d.active
-    )
+    OR public.freight_acct_driver_linked_to(freight_bookings.carrier_account_id)
   );
 
 -- Sự kiện: hai phía của booking + tài xế liên kết đọc được; append-only
@@ -765,15 +877,7 @@ CREATE POLICY freight_bookings_select_acct ON public.freight_bookings
 DROP POLICY IF EXISTS freight_events_select_acct ON public.freight_booking_events;
 CREATE POLICY freight_events_select_acct ON public.freight_booking_events
   FOR SELECT TO authenticated USING (
-    EXISTS (
-      SELECT 1 FROM public.freight_bookings b
-      WHERE b.id = freight_booking_events.booking_id
-        AND (b.shipper_account_id = auth.uid() OR b.carrier_account_id = auth.uid()
-          OR EXISTS (
-            SELECT 1 FROM public.freight_my_drivers d
-            WHERE d.user_id = auth.uid() AND d.account_id = b.carrier_account_id AND d.active
-          ))
-    )
+    public.freight_acct_booking_visible(freight_booking_events.booking_id)
   );
 
 -- Chia sẻ tải vào group: chủ tải và thành viên group đích đọc được.
@@ -798,6 +902,14 @@ GRANT EXECUTE ON FUNCTION public.freight_acct_is_linked(uuid, uuid) TO authentic
 GRANT EXECUTE ON FUNCTION public.freight_acct_actor_side(uuid, uuid) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.freight_acct_my_linked_ids() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.freight_acct_shares_group(uuid, uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_driver_linked_to(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_booking_visible(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_load_has_my_booking(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_vehicle_in_my_booking(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_driver_in_my_booking(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_warehouse_pickup_for_me(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_vehicle_proposed_to_me(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_driver_proposed_to_me(uuid) TO authenticated;
 
 -- ---------------------------------------------------------------------
 -- 6. VIEW TRA CỨU freight_loads_discover (bản rút gọn theo tài khoản)
@@ -1637,22 +1749,12 @@ CREATE POLICY freight_bid_history_select ON public.freight_bid_history
 DROP POLICY IF EXISTS freight_my_vehicles_select_bid ON public.freight_my_vehicles;
 CREATE POLICY freight_my_vehicles_select_bid ON public.freight_my_vehicles
   FOR SELECT TO authenticated USING (
-    EXISTS (
-      SELECT 1 FROM public.freight_bids b
-      JOIN public.freight_loads l ON l.id = b.load_id
-      WHERE b.proposed_vehicle_id = freight_my_vehicles.id
-        AND l.poster_account_id = auth.uid()
-    )
+    public.freight_acct_vehicle_proposed_to_me(freight_my_vehicles.id)
   );
 DROP POLICY IF EXISTS freight_my_drivers_select_bid ON public.freight_my_drivers;
 CREATE POLICY freight_my_drivers_select_bid ON public.freight_my_drivers
   FOR SELECT TO authenticated USING (
-    EXISTS (
-      SELECT 1 FROM public.freight_bids b
-      JOIN public.freight_loads l ON l.id = b.load_id
-      WHERE b.proposed_driver_id = freight_my_drivers.id
-        AND l.poster_account_id = auth.uid()
-    )
+    public.freight_acct_driver_proposed_to_me(freight_my_drivers.id)
   );
 
 GRANT SELECT ON public.freight_bids, public.freight_bid_history TO authenticated;
