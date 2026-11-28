@@ -99,6 +99,8 @@ export interface FreightLoad {
   visibility: LoadVisibility
   directed_group_id: string | null
   asking_price: number | null
+  /** T2: tải có nhận chào giá không (mặc định theo mức hiển thị). */
+  open_for_bids: boolean
   status: LoadStatus
   expires_at: string | null
   created_at: string

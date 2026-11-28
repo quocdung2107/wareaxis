@@ -7,6 +7,7 @@
 import { supabase } from './client'
 import { FreightError, freightErrText, type Booking, type BookingEvent, type FreightLoad } from './freight'
 import type { AccountLinkStatus } from '../../domain/freight/account'
+import type { BidStatus } from '../../domain/freight/bid'
 import type { BookingStatus } from '../../domain/freight/booking'
 import type { LoadStatus, LoadVisibility } from '../../domain/freight/load'
 
@@ -23,6 +24,15 @@ const ACCT_ERRORS: Record<string, string> = {
   already_linked: 'Hai tài khoản đã kết nối với nhau rồi.',
   link_not_found: 'Không tìm thấy kết nối này.',
   cannot_link_self: 'Không thể kết nối với chính tài khoản của mình.',
+  // T2 — chào giá:
+  own_load: 'Không tự đặt chào giá cho tải của chính mình được — tự vận chuyển hãy dùng Chỉ định và chọn chính tài khoản của bạn.',
+  bidding_closed: 'Tải này không mở chào giá.',
+  not_visible: 'Bạn không thấy được tải này nên không đặt chào giá được.',
+  bid_not_found: 'Không tìm thấy chào giá này.',
+  bid_expired: 'Chào giá đã hết hạn hiệu lực.',
+  not_bid_owner: 'Chào giá này không phải của bạn.',
+  invalid_price: 'Giá chào phải lớn hơn 0.',
+  invalid_expiry: 'Hạn hiệu lực chào giá phải ở tương lai.',
 }
 
 /** Map lỗi RPC sang tiếng Việt: mã riêng của mô hình tài khoản trước, còn lại dùng map dùng chung. */
@@ -151,6 +161,8 @@ export interface DiscoverLoad {
   delivery_window_to: string | null
   visibility: LoadVisibility
   asking_price: number | null
+  /** T2: tải có đang mở chào giá không. */
+  open_for_bids: boolean
   status: LoadStatus
   expires_at: string | null
   created_at: string
@@ -162,6 +174,8 @@ export type AcctBooking = Booking & {
   carrier_account_id: string | null
   my_vehicle_id: string | null
   my_driver_id: string | null
+  /** T2: bid nguồn nếu chuyến sinh ra từ chào giá (null nếu chỉ định trực tiếp). */
+  bid_id: string | null
 }
 
 export type { BookingEvent }
@@ -371,6 +385,8 @@ export interface CreateAcctLoadInput {
   directedAccountId?: string | null
   askingPrice?: number | null
   expiresAt?: string | null
+  /** T2: mở chào giá? null/bỏ trống = mặc định theo mức hiển thị (DIRECT tắt, NETWORK/PUBLIC mở). */
+  openForBids?: boolean | null
 }
 
 export async function createLoadAcct(i: CreateAcctLoadInput): Promise<AcctLoad> {
@@ -397,6 +413,7 @@ export async function createLoadAcct(i: CreateAcctLoadInput): Promise<AcctLoad> 
     p_directed_account_id: i.directedAccountId ?? null,
     p_asking_price: i.askingPrice ?? null,
     p_expires_at: i.expiresAt ?? null,
+    p_open_for_bids: i.openForBids ?? null,
   })
 }
 
@@ -499,4 +516,147 @@ export async function advanceBookingAcct(
 
 export async function cancelBookingAcct(bookingId: string, reason: string): Promise<AcctBooking> {
   return rpc<AcctBooking>('freight_acct_cancel_booking', { p_booking_id: bookingId, p_reason: reason })
+}
+
+// ----- T2: Chào giá (freight_bids) -----
+
+/** Một chào giá (bảng freight_bids). Tên cột theo thiết kế Phần 3.1. */
+export interface FreightBid {
+  id: string
+  load_id: string
+  carrier_account_id: string
+  bid_price: number
+  currency: string
+  proposed_vehicle_id: string | null
+  proposed_driver_id: string | null
+  eta_pickup_at: string | null
+  note: string | null
+  status: BidStatus
+  closed_reason: string | null
+  expires_at: string
+  created_at: string
+  updated_at: string
+}
+
+export interface BidHistoryRow {
+  id: number
+  bid_id: string
+  old_price: number | null
+  new_price: number | null
+  old_eta_pickup_at: string | null
+  new_eta_pickup_at: string | null
+  changed_by: string
+  created_at: string
+}
+
+export interface PlaceBidInput {
+  loadId: string
+  bidPrice: number
+  proposedVehicleId?: string | null
+  proposedDriverId?: string | null
+  etaPickupAt?: string | null
+  note?: string | null
+  expiresAt?: string | null
+}
+
+/**
+ * Đặt chào giá. Nếu đã có bid PENDING của chính mình cho tải này, RPC
+ * CẬP NHẬT bid đó (sửa giá tại chỗ + ghi lịch sử) và trả về bid đã cập
+ * nhật — không bao giờ tạo bid hiệu lực thứ hai.
+ */
+export async function placeBid(i: PlaceBidInput): Promise<FreightBid> {
+  return rpc<FreightBid>('freight_acct_place_bid', {
+    p_load_id: i.loadId,
+    p_bid_price: i.bidPrice,
+    p_proposed_vehicle_id: i.proposedVehicleId ?? null,
+    p_proposed_driver_id: i.proposedDriverId ?? null,
+    p_eta_pickup_at: i.etaPickupAt ?? null,
+    p_note: i.note ?? null,
+    p_expires_at: i.expiresAt ?? null,
+  })
+}
+
+/** Sửa bid của chính mình (chỉ khi PENDING, chưa hết hạn). */
+export async function updateBid(bidId: string, i: Omit<PlaceBidInput, 'loadId'>): Promise<FreightBid> {
+  return rpc<FreightBid>('freight_acct_update_bid', {
+    p_bid_id: bidId,
+    p_bid_price: i.bidPrice,
+    p_proposed_vehicle_id: i.proposedVehicleId ?? null,
+    p_proposed_driver_id: i.proposedDriverId ?? null,
+    p_eta_pickup_at: i.etaPickupAt ?? null,
+    p_note: i.note ?? null,
+    p_expires_at: i.expiresAt ?? null,
+  })
+}
+
+/** Rút chào giá của chính mình. */
+export async function withdrawBid(bidId: string): Promise<FreightBid> {
+  return rpc<FreightBid>('freight_acct_withdraw_bid', { p_bid_id: bidId })
+}
+
+/** Chủ tải từ chối một bid (lý do tuỳ chọn — chỉ để nhà xe biết). */
+export async function rejectBid(bidId: string, reason: string | null): Promise<FreightBid> {
+  return rpc<FreightBid>('freight_acct_reject_bid', { p_bid_id: bidId, p_reason: reason })
+}
+
+/**
+ * Chủ tải chấp nhận một bid — nguyên tử phía server: tạo booking ở
+ * trạng thái BOOKED (giá đóng băng = giá bid, xe/tài xế dự kiến gán
+ * sẵn), đóng mọi bid còn lại của tải. Trả về booking vừa tạo.
+ */
+export async function acceptBid(bidId: string): Promise<AcctBooking> {
+  return rpc<AcctBooking>('freight_acct_accept_bid', { p_bid_id: bidId })
+}
+
+/** Mọi bid của MỘT tải mà phía gọi được quyền thấy (chủ tải: tất cả; nhà xe: của mình). */
+export async function listBidsForLoad(loadId: string): Promise<FreightBid[]> {
+  return query<FreightBid[]>(() =>
+    sb().from('freight_bids').select('*').eq('load_id', loadId).order('bid_price', { ascending: true }),
+  )
+}
+
+/**
+ * Mọi bid mà tài khoản của tôi THẤY ĐƯỢC qua RLS: bid của chính tôi
+ * (phía nhà xe) + bid trên các tải của tôi (phía chủ tải) + bid thắng
+ * của các chuyến tôi là một phía. UI tự lọc theo nhu cầu.
+ */
+export async function listVisibleBids(): Promise<FreightBid[]> {
+  return query<FreightBid[]>(() =>
+    sb().from('freight_bids').select('*').order('created_at', { ascending: false }).limit(500),
+  )
+}
+
+/** Các bid của chính tôi ở phía nhà xe, mới nhất trước. */
+export async function listMyBids(me: string): Promise<FreightBid[]> {
+  return query<FreightBid[]>(() =>
+    sb().from('freight_bids').select('*').eq('carrier_account_id', me).order('created_at', { ascending: false }).limit(200),
+  )
+}
+
+/** Lịch sử sửa giá/ETA của một bid (hai phía của bid đều đọc được). */
+export async function listBidHistory(bidId: string): Promise<BidHistoryRow[]> {
+  return query<BidHistoryRow[]>(() =>
+    sb().from('freight_bid_history').select('*').eq('bid_id', bidId).order('id', { ascending: true }),
+  )
+}
+
+/**
+ * Quét hết hạn cơ hội (đóng bid/tải quá hạn phía server). Gọi khi mở
+ * tab Tìm xe; lỗi bị bỏ qua ở nơi gọi — dữ liệu vẫn đúng nhờ đóng lười
+ * trong từng RPC.
+ */
+export async function expireStale(): Promise<number> {
+  return rpc<number>('freight_acct_expire_stale', {})
+}
+
+/** Đọc xe theo danh sách id (RLS tự lọc: của tôi + xe được đề xuất trong bid cho tải của tôi). */
+export async function listVehiclesByIds(ids: string[]): Promise<MyVehicle[]> {
+  if (ids.length === 0) return []
+  return query<MyVehicle[]>(() => sb().from('freight_my_vehicles').select('*').in('id', ids))
+}
+
+/** Đọc tài xế theo danh sách id (RLS tự lọc như xe). */
+export async function listDriversByIds(ids: string[]): Promise<MyDriver[]> {
+  if (ids.length === 0) return []
+  return query<MyDriver[]>(() => sb().from('freight_my_drivers').select('*').in('id', ids))
 }

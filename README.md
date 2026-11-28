@@ -215,20 +215,33 @@ tên **Tìm xe & chuyến** (Kho → Hệ thống), kèm trang **Điều khoản
 Đã có trong code:
 
 - Migration gộp bản sạch `supabase/migrations/20261128020000_freight_account_model_fresh.sql`:
-  toàn bộ schema freight ở trạng thái cuối của mô hình tài khoản — 10 bảng `freight_*`
+  toàn bộ schema freight ở trạng thái cuối của mô hình tài khoản — 12 bảng `freight_*`
   (`freight_account_profiles`, `freight_my_warehouses/vehicles/drivers/routes`,
   `freight_account_links`, `freight_loads`, `freight_bookings`,
-  `freight_booking_events`, `freight_load_groups`), view `freight_loads_discover`,
-  RLS theo tài khoản và chỉ bộ RPC `freight_acct_*` (12 RPC). Chỉ tạo đối tượng
-  `freight_*`; trạng thái chuyến ánh xạ một chiều sang 6 trạng thái đơn cũ qua lớp
-  đồng bộ bọc lỗi (`freight_sync_order`).
+  `freight_booking_events`, `freight_load_groups`, và từ R2: `freight_bids`,
+  `freight_bid_history`), view `freight_loads_discover` (có cột `open_for_bids`),
+  RLS theo tài khoản và chỉ bộ RPC `freight_acct_*` (12 RPC của R1 + 6 RPC chào giá
+  của R2). Chỉ tạo đối tượng `freight_*`; trạng thái chuyến ánh xạ một chiều sang 6
+  trạng thái đơn cũ qua lớp đồng bộ bọc lỗi (`freight_sync_order`).
+- **R2 — T2 chào giá** (đã có trong file fresh): nhà xe đặt giá vào tải đang mở
+  (`freight_loads.open_for_bids` — DIRECT mặc định tắt, NETWORK/PUBLIC mặc định mở);
+  mỗi (tải, tài khoản) tối đa một bid đang hiệu lực, sửa giá cập nhật tại chỗ + ghi
+  `freight_bid_history`; chủ tải chấp nhận một bid qua RPC `freight_acct_accept_bid`
+  **nguyên tử** — sinh booking ở trạng thái `BOOKED` ngay (giá đóng băng = giá bid,
+  xe/tài xế dự kiến gán sẵn, `freight_bookings.bid_id` ghi bid nguồn), các bid còn
+  lại tự đóng `REJECTED/lost`. Bid hết hạn được đóng lười trong RPC +
+  `freight_acct_expire_stale()` quét cơ hội; chủ tải **không** tự đặt bid cho tải
+  của mình (tự vận chuyển đi đường chỉ định trực tiếp). Máy trạng thái tải không
+  thêm trạng thái BIDDING. Hướng dẫn: `wms-nang-cap/huong-dan-r2-chao-gia.md`.
 - Domain thuần `src/domain/freight/` (máy trạng thái Load/Booking giữ nguyên từ T1,
-  ánh xạ sang đơn cũ, validate mềm hồ sơ tự khai, logic tài khoản ở `account.ts`) +
-  test `tests/freight.test.ts`, `tests/freight-account.test.ts`.
+  ánh xạ sang đơn cũ, validate mềm hồ sơ tự khai, logic tài khoản ở `account.ts`,
+  logic chào giá ở `bid.ts`) + test `tests/freight.test.ts`,
+  `tests/freight-account.test.ts`, `tests/freight-bid.test.ts`.
 - API client `src/shared/supabase/freightAccount.ts` (file `freight.ts` chỉ còn phần
   nền dùng chung + đọc groups/orders_view tối thiểu); UI bằng **dialog Thêm/Sửa**
-  (component `FormDialog` dùng chung): tab Đăng ký của tôi / Tìm xe & Tải / Chuyến
-  của tôi / Kết nối.
+  (component `FormDialog` dùng chung): tab Đăng ký của tôi / Tìm xe & Tải (gồm khối
+  “Đang mở chào giá” + “Chào giá của tôi”, dialog Xem chào giá phía chủ tải) /
+  Chuyến của tôi / Kết nối.
 
 ### Quy trình phát triển freight: RESET — CÀI MỚI (không di trú)
 
@@ -244,10 +257,11 @@ dùng cài lại trên Supabase Dashboard → SQL Editor theo 3 bước:
    (bảng/view/sequence/hàm), tuyệt đối không đụng dữ liệu app đang chạy.
 3. Chạy migration gộp bản sạch ở trên, rồi kiểm chứng theo khối cuối file đó.
 
-Hướng dẫn chi tiết: `wms-nang-cap/huong-dan-reset-va-cai-lai-freight.md`.
+Hướng dẫn chi tiết: `wms-nang-cap/huong-dan-reset-va-cai-lai-freight.md` (cài lại
+nền) và `wms-nang-cap/huong-dan-r2-chao-gia.md` (cập nhật + nghiệm thu chào giá).
 Hai migration freight cũ (T1 `20261127000000...` và R1 `20261128000000...`) đã bị
-xoá khỏi repo khi chuyển sang quy trình này. Chưa làm: T2 chào giá (đã thiết kế,
-chưa triển khai), T3 POD + link theo dõi + ghi nhận cước, T4 đánh giá + GPS mức 2.
+xoá khỏi repo khi chuyển sang quy trình này. Chưa làm: T3 POD + link theo dõi +
+ghi nhận cước, T4 đánh giá + GPS mức 2.
 
 ## Triển khai lên GitHub Pages
 

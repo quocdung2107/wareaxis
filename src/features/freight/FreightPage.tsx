@@ -122,7 +122,7 @@ function AccountGate({ me, displayName }: { me: string; displayName: string }) {
       {tab === 'account' && (
         <AccountTab key={`a-${profile.data.updated_at}`} ctx={ctx} onAccountChanged={profile.reload} />
       )}
-      {tab === 'loads' && <LoadsTab key="l" ctx={ctx} />}
+      {tab === 'loads' && <LoadsTab key="l" ctx={ctx} onGoBookings={() => setTab('bookings')} />}
       {tab === 'bookings' && <BookingsTab key="b" ctx={ctx} />}
       {tab === 'links' && <LinksTab key="k" ctx={ctx} />}
     </div>

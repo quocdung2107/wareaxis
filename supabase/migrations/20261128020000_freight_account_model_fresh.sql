@@ -14,6 +14,14 @@
 --   freight_acct_* (mô hình tài khoản), KHÔNG còn RPC group của T1,
 --   KHÔNG có khối di trú, KHÔNG có đánh dấu deprecated.
 --
+--   R2 (T2 — CHÀO GIÁ) đã gộp vào file này (mục 8): cột
+--   freight_loads.open_for_bids, bảng freight_bids + freight_bid_history,
+--   freight_bookings.bid_id, RPC freight_acct_place_bid / update_bid /
+--   withdraw_bid / reject_bid / accept_bid (nguyên tử) /
+--   expire_stale. Thiết kế: thiet-ke-lai-tai-khoan-va-t2-chao-gia.md
+--   Phần 3. Máy trạng thái tải KHÔNG thêm trạng thái BIDDING — "đang có
+--   chào giá" là trạng thái hiển thị suy ra từ bid PENDING.
+--
 -- Nội dung:
 --   Mỗi tài khoản (auth.users) có MỘT hồ sơ đăng ký riêng
 --   (freight_account_profiles, hai cờ độc lập is_shipper / is_carrier),
@@ -324,6 +332,9 @@ CREATE TABLE IF NOT EXISTS public.freight_loads (
   directed_group_id uuid,
   directed_account_id uuid,
   asking_price numeric,
+  -- T2: tải có nhận chào giá không. Mặc định theo mức hiển thị do RPC
+  -- tạo tải quyết (DIRECT=false, NETWORK/PUBLIC=true), chủ tải đổi được.
+  open_for_bids boolean NOT NULL DEFAULT false,
   status text NOT NULL DEFAULT 'POSTED' CHECK (status IN ('DRAFT', 'POSTED', 'ASSIGNED', 'BOOKED', 'EXPIRED', 'CANCELLED')),
   expires_at timestamptz,
   created_by uuid,
@@ -822,7 +833,8 @@ SELECT
   l.asking_price,
   l.status,
   l.expires_at,
-  l.created_at
+  l.created_at,
+  l.open_for_bids
 FROM public.freight_loads l
 LEFT JOIN public.freight_account_profiles ap ON ap.account_id = l.poster_account_id
 WHERE l.status = 'POSTED'
@@ -852,6 +864,9 @@ GRANT SELECT ON public.freight_loads_discover TO authenticated;
 -- order_not_in_group, warehouse_not_found, vehicle_not_found,
 -- driver_not_found, has_active_booking, already_booked, invalid_role,
 -- account_not_found, already_linked, link_not_found, cannot_link_self.
+-- Mã lỗi T2 (mục 8): own_load, bidding_closed, not_visible,
+-- invalid_price, invalid_expiry, bid_not_found, bid_expired,
+-- not_bid_owner.
 -- ---------------------------------------------------------------------
 
 -- ----- Hồ sơ tài khoản (tự khai) -----
@@ -910,7 +925,8 @@ CREATE OR REPLACE FUNCTION public.freight_acct_create_load(
   p_delivery_address text, p_delivery_province text,
   p_delivery_contact_name text, p_delivery_contact_phone text,
   p_pickup_window_from timestamptz, p_pickup_window_to timestamptz, p_delivery_window_to timestamptz,
-  p_visibility text, p_directed_account_id uuid, p_asking_price numeric, p_expires_at timestamptz
+  p_visibility text, p_directed_account_id uuid, p_asking_price numeric, p_expires_at timestamptz,
+  p_open_for_bids boolean
 )
 RETURNS public.freight_loads
 LANGUAGE plpgsql
@@ -920,6 +936,10 @@ AS $$
 DECLARE
   v_uid uuid := public.freight_require_uid();
   v_group uuid := p_source_group_id;
+  -- T2 (thiết kế 3.4): DIRECT mặc định KHÔNG nhận bid (chỉ bật khi chủ
+  -- tải chủ động chọn — khi đó chỉ tài khoản được chỉ định chào được);
+  -- NETWORK/PUBLIC mặc định MỞ chào giá, chủ tải tắt được.
+  v_open boolean := COALESCE(p_open_for_bids, p_visibility <> 'DIRECT');
   v_row public.freight_loads;
 BEGIN
   IF COALESCE(btrim(p_goods_desc), '') = '' THEN
@@ -965,7 +985,7 @@ BEGIN
     vehicle_type_required, pickup_point_id, pickup_address, pickup_province,
     delivery_address, delivery_province, delivery_contact_name, delivery_contact_phone,
     pickup_window_from, pickup_window_to, delivery_window_to,
-    visibility, directed_account_id, asking_price, status, expires_at, created_by,
+    visibility, directed_account_id, asking_price, open_for_bids, status, expires_at, created_by,
     poster_account_id
   ) VALUES (
     'TAI-' || lpad(nextval('public.freight_load_code_seq')::text, 6, '0'),
@@ -973,7 +993,7 @@ BEGIN
     p_vehicle_type_required, p_pickup_point_id, p_pickup_address, p_pickup_province,
     p_delivery_address, p_delivery_province, p_delivery_contact_name, p_delivery_contact_phone,
     p_pickup_window_from, p_pickup_window_to, p_delivery_window_to,
-    p_visibility, p_directed_account_id, p_asking_price, 'POSTED', p_expires_at, v_uid,
+    p_visibility, p_directed_account_id, p_asking_price, v_open, 'POSTED', p_expires_at, v_uid,
     v_uid
   )
   RETURNING * INTO v_row;
@@ -1409,7 +1429,7 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.freight_acct_upsert_profile(text, text, text, text, text, text, text, boolean, boolean, text, text) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.freight_acct_create_load(uuid, uuid, text, text, numeric, int, numeric, text, uuid, text, text, text, text, text, text, timestamptz, timestamptz, timestamptz, text, uuid, numeric, timestamptz) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_create_load(uuid, uuid, text, text, numeric, int, numeric, text, uuid, text, text, text, text, text, text, timestamptz, timestamptz, timestamptz, text, uuid, numeric, timestamptz, boolean) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.freight_acct_cancel_load(uuid, text) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.freight_acct_share_load_to_group(uuid, uuid) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.freight_acct_unshare_load(uuid, uuid) TO authenticated;
@@ -1421,11 +1441,572 @@ GRANT EXECUTE ON FUNCTION public.freight_acct_cancel_booking(uuid, text) TO auth
 GRANT EXECUTE ON FUNCTION public.freight_acct_invite_link(uuid) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.freight_acct_respond_link(uuid, boolean) TO authenticated;
 
+-- ---------------------------------------------------------------------
+-- 8. T2 — CHÀO GIÁ (R2)
+-- Thiết kế: thiet-ke-lai-tai-khoan-va-t2-chao-gia.md Phần 3.
+--   * Bid là ĐỀ NGHỊ chủ động của nhà xe (giá + xe/tài xế dự kiến + giờ
+--     lấy + hạn hiệu lực). Sửa giá = cập nhật chính bid đó + ghi
+--     freight_bid_history. Một (tải, tài khoản) tối đa MỘT bid PENDING.
+--   * freight_acct_accept_bid NGUYÊN TỬ: RPC không quyết định chọn ai —
+--     quyết định là của chủ tải; RPC chỉ bảo đảm toàn vẹn dữ liệu trong
+--     khoảnh khắc chốt (một tải tối đa một booking sống, giá chốt đóng
+--     băng = giá bid, bid hết hạn/rút không chốt được). Booking thắng
+--     bid vào thẳng BOOKED (không qua PENDING_CONFIRM) vì hai phía đã
+--     xác nhận lẫn nhau qua chào/chấp nhận.
+--   * Hết hạn theo cơ chế LƯỜI: các RPC liên quan tự đóng bid quá hạn
+--     khi chạm vào; freight_acct_expire_stale() để client gọi cơ hội
+--     (không phụ thuộc pg_cron).
+--   * Xe/tài xế dự kiến trong bid cũng KHÔNG kiểm tra hạn giấy tờ
+--     (NT-02, nhất quán toàn hệ).
+-- ---------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS public.freight_bids (
+  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  load_id             uuid NOT NULL REFERENCES public.freight_loads (id) ON DELETE CASCADE,
+  -- Tài khoản nhà xe chào giá (tên theo thiết kế Phần 3.1).
+  carrier_account_id  uuid NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
+  bid_price           numeric NOT NULL CHECK (bid_price > 0),
+  currency            text NOT NULL DEFAULT 'VND',
+  proposed_vehicle_id uuid REFERENCES public.freight_my_vehicles (id) ON DELETE SET NULL,
+  proposed_driver_id  uuid REFERENCES public.freight_my_drivers (id) ON DELETE SET NULL,
+  eta_pickup_at       timestamptz,
+  note                text,
+  status              text NOT NULL DEFAULT 'PENDING'
+                      CHECK (status IN ('PENDING', 'ACCEPTED', 'REJECTED', 'WITHDRAWN', 'EXPIRED')),
+  -- 'lost' (thua bid thắng) | 'load_cancelled' | 'expired' | lý do chủ tải từ chối.
+  closed_reason       text,
+  expires_at          timestamptz NOT NULL,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  updated_at          timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_freight_bids_load ON public.freight_bids (load_id, status);
+CREATE INDEX IF NOT EXISTS idx_freight_bids_carrier ON public.freight_bids (carrier_account_id, status);
+-- Một tài khoản chỉ có TỐI ĐA MỘT bid đang hiệu lực cho một tải.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_freight_bids_live_per_load_carrier
+  ON public.freight_bids (load_id, carrier_account_id) WHERE status = 'PENDING';
+
+CREATE TABLE IF NOT EXISTS public.freight_bid_history (
+  id          bigserial PRIMARY KEY,
+  bid_id      uuid NOT NULL REFERENCES public.freight_bids (id) ON DELETE CASCADE,
+  old_price   numeric,
+  new_price   numeric,
+  old_eta_pickup_at timestamptz,
+  new_eta_pickup_at timestamptz,
+  changed_by  uuid NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_freight_bid_history_bid ON public.freight_bid_history (bid_id, id);
+
+-- Booking thắng bid ghi lại bid nguồn — giá chốt đã đóng băng ở
+-- price_agreed = bid_price tại thời điểm accept.
+ALTER TABLE public.freight_bookings
+  ADD COLUMN IF NOT EXISTS bid_id uuid REFERENCES public.freight_bids (id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_freight_bookings_bid ON public.freight_bookings (bid_id);
+
+DROP TRIGGER IF EXISTS trg_freight_bids_touch ON public.freight_bids;
+CREATE TRIGGER trg_freight_bids_touch BEFORE UPDATE ON public.freight_bids
+  FOR EACH ROW EXECUTE FUNCTION public.freight_touch_updated_at();
+
+-- ----- Helper T2 -----
+
+/**
+ * Tài khoản p_uid có THẤY ĐƯỢC tải p_load_id không — cùng quy tắc với
+ * view freight_loads_discover (Phần 1.5): của mình / PUBLIC / DIRECT
+ * được chỉ định / NETWORK đã kết nối hoặc cùng group / được chia sẻ
+ * vào group mình là thành viên.
+ */
+CREATE OR REPLACE FUNCTION public.freight_acct_load_visible_to(p_load_id uuid, p_uid uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_loads l
+    WHERE l.id = p_load_id AND (
+      l.poster_account_id = p_uid
+      OR l.visibility = 'PUBLIC'
+      OR (l.visibility = 'DIRECT' AND l.directed_account_id = p_uid)
+      OR (l.visibility = 'NETWORK' AND (
+        public.freight_acct_is_linked(l.poster_account_id, p_uid)
+        OR public.freight_acct_shares_group(l.poster_account_id, p_uid)))
+      OR EXISTS (
+        SELECT 1 FROM public.freight_load_groups lg
+        JOIN public.group_members gm ON gm.group_id = lg.group_id
+        WHERE lg.load_id = l.id AND gm.user_id = p_uid
+      )
+    )
+  );
+$$;
+
+/**
+ * auth.uid() có quyền ĐỌC bid này không: chính bên chào, chủ tải của
+ * tải chứa bid, hoặc một phía của booking sinh ra từ bid. Dùng trong
+ * RLS của freight_bids / freight_bid_history (SECURITY DEFINER để
+ * tránh đệ quy RLS).
+ */
+CREATE OR REPLACE FUNCTION public.freight_acct_can_see_bid(p_bid_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_bids b
+    WHERE b.id = p_bid_id AND (
+      b.carrier_account_id = auth.uid()
+      OR EXISTS (
+        SELECT 1 FROM public.freight_loads l
+        WHERE l.id = b.load_id AND l.poster_account_id = auth.uid()
+      )
+      OR EXISTS (
+        SELECT 1 FROM public.freight_bookings bk
+        WHERE bk.bid_id = b.id
+          AND (bk.shipper_account_id = auth.uid() OR bk.carrier_account_id = auth.uid())
+      )
+    )
+  );
+$$;
+
+/** Đóng (EXPIRED) các bid PENDING đã quá hạn của MỘT tải. Trả số dòng. */
+CREATE OR REPLACE FUNCTION public.freight_acct_expire_bids(p_load_id uuid)
+RETURNS int
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_n int;
+BEGIN
+  UPDATE public.freight_bids
+  SET status = 'EXPIRED', closed_reason = 'expired'
+  WHERE load_id = p_load_id AND status = 'PENDING' AND expires_at <= now();
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  RETURN v_n;
+END;
+$$;
+
+/**
+ * Quét hết hạn cơ hội (client gọi khi mở tab Tìm xe / Chuyến, lỗi được
+ * bỏ qua phía client): đóng mọi bid PENDING quá hạn + tải POSTED quá
+ * hạn đăng mà chưa có booking sống. Trả tổng số dòng đã đóng.
+ */
+CREATE OR REPLACE FUNCTION public.freight_acct_expire_stale()
+RETURNS int
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_bids int;
+  v_loads int;
+BEGIN
+  PERFORM public.freight_require_uid();
+  UPDATE public.freight_bids
+  SET status = 'EXPIRED', closed_reason = 'expired'
+  WHERE status = 'PENDING' AND expires_at <= now();
+  GET DIAGNOSTICS v_bids = ROW_COUNT;
+  UPDATE public.freight_loads
+  SET status = 'EXPIRED'
+  WHERE status = 'POSTED' AND expires_at IS NOT NULL AND expires_at <= now()
+    AND NOT EXISTS (
+      SELECT 1 FROM public.freight_bookings b
+      WHERE b.load_id = freight_loads.id AND b.status NOT IN ('CANCELLED', 'DECLINED')
+    );
+  GET DIAGNOSTICS v_loads = ROW_COUNT;
+  RETURN v_bids + v_loads;
+END;
+$$;
+
+-- ----- RLS T2: bid/history CHỈ ĐỌC qua RLS; mọi thao tác ghi qua RPC -----
+
+ALTER TABLE public.freight_bids ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.freight_bid_history ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS freight_bids_select ON public.freight_bids;
+CREATE POLICY freight_bids_select ON public.freight_bids
+  FOR SELECT TO authenticated USING (public.freight_acct_can_see_bid(id));
+DROP POLICY IF EXISTS freight_bid_history_select ON public.freight_bid_history;
+CREATE POLICY freight_bid_history_select ON public.freight_bid_history
+  FOR SELECT TO authenticated USING (public.freight_acct_can_see_bid(bid_id));
+
+-- Chủ tải đọc được xe/tài xế ĐƯỢC ĐỀ XUẤT trong bid cho tải của mình
+-- (hiển thị biển số/loại xe trong bảng chào giá trước khi chốt).
+DROP POLICY IF EXISTS freight_my_vehicles_select_bid ON public.freight_my_vehicles;
+CREATE POLICY freight_my_vehicles_select_bid ON public.freight_my_vehicles
+  FOR SELECT TO authenticated USING (
+    EXISTS (
+      SELECT 1 FROM public.freight_bids b
+      JOIN public.freight_loads l ON l.id = b.load_id
+      WHERE b.proposed_vehicle_id = freight_my_vehicles.id
+        AND l.poster_account_id = auth.uid()
+    )
+  );
+DROP POLICY IF EXISTS freight_my_drivers_select_bid ON public.freight_my_drivers;
+CREATE POLICY freight_my_drivers_select_bid ON public.freight_my_drivers
+  FOR SELECT TO authenticated USING (
+    EXISTS (
+      SELECT 1 FROM public.freight_bids b
+      JOIN public.freight_loads l ON l.id = b.load_id
+      WHERE b.proposed_driver_id = freight_my_drivers.id
+        AND l.poster_account_id = auth.uid()
+    )
+  );
+
+GRANT SELECT ON public.freight_bids, public.freight_bid_history TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_load_visible_to(uuid, uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_can_see_bid(uuid) TO authenticated;
+
+-- ----- RPC chào giá -----
+
+/**
+ * Đặt chào giá cho một tải. Điều kiện (thiết kế 3.2): tải còn POSTED +
+ * chưa có booking sống + chưa hết hạn đăng (load_not_open); tải bật
+ * chào giá (bidding_closed); người gọi THẤY ĐƯỢC tải (not_visible);
+ * người gọi có vai trò vận tải (not_carrier) và KHÔNG phải chủ tải
+ * (own_load — tự vận chuyển đi đường chỉ định, không qua bid).
+ * Nếu đã có bid PENDING của chính mình cho tải này: CẬP NHẬT bid đó
+ * (giá/ghi chú/hạn/xe/tài xế dự kiến) + ghi history khi giá/ETA đổi —
+ * không tạo bid mới (giữ bất biến 1 bid hiệu lực/tài khoản/tải).
+ * Hạn hiệu lực mặc định nếu không khai: LEAST(now()+72h, hạn đăng tải).
+ */
+CREATE OR REPLACE FUNCTION public.freight_acct_place_bid(
+  p_load_id uuid, p_bid_price numeric, p_proposed_vehicle_id uuid, p_proposed_driver_id uuid,
+  p_eta_pickup_at timestamptz, p_note text, p_expires_at timestamptz
+)
+RETURNS public.freight_bids
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid uuid := public.freight_require_uid();
+  v_load public.freight_loads;
+  v_bid public.freight_bids;
+  v_expires timestamptz;
+BEGIN
+  SELECT * INTO v_load FROM public.freight_loads WHERE id = p_load_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'load_not_found';
+  END IF;
+  IF v_load.poster_account_id = v_uid THEN
+    RAISE EXCEPTION 'own_load';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM public.freight_account_profiles ap
+    WHERE ap.account_id = v_uid AND ap.is_carrier
+  ) THEN
+    RAISE EXCEPTION 'not_carrier';
+  END IF;
+  -- Hết hạn lười cho tải này trước khi xét điều kiện mở.
+  PERFORM public.freight_acct_expire_bids(v_load.id);
+  IF v_load.status = 'POSTED' AND v_load.expires_at IS NOT NULL AND v_load.expires_at <= now() THEN
+    UPDATE public.freight_loads SET status = 'EXPIRED' WHERE id = v_load.id;
+    v_load.status := 'EXPIRED';
+  END IF;
+  IF v_load.status <> 'POSTED' THEN
+    RAISE EXCEPTION 'load_not_open';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM public.freight_bookings b
+    WHERE b.load_id = v_load.id AND b.status NOT IN ('CANCELLED', 'DECLINED')
+  ) THEN
+    RAISE EXCEPTION 'load_not_open';
+  END IF;
+  IF NOT v_load.open_for_bids THEN
+    RAISE EXCEPTION 'bidding_closed';
+  END IF;
+  IF NOT public.freight_acct_load_visible_to(v_load.id, v_uid) THEN
+    RAISE EXCEPTION 'not_visible';
+  END IF;
+  IF p_bid_price IS NULL OR p_bid_price <= 0 THEN
+    RAISE EXCEPTION 'invalid_price';
+  END IF;
+  IF p_proposed_vehicle_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM public.freight_my_vehicles v
+    WHERE v.id = p_proposed_vehicle_id AND v.account_id = v_uid
+  ) THEN
+    RAISE EXCEPTION 'vehicle_not_found';
+  END IF;
+  IF p_proposed_driver_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM public.freight_my_drivers d
+    WHERE d.id = p_proposed_driver_id AND d.account_id = v_uid
+  ) THEN
+    RAISE EXCEPTION 'driver_not_found';
+  END IF;
+  -- Hạn hiệu lực là hạn của một ĐỀ NGHỊ do chính người chào tự đặt:
+  -- chặn giá trị đã ở quá khứ là toàn vẹn dữ liệu, không phải kiểm
+  -- soát giấy tờ bên thứ ba.
+  IF p_expires_at IS NOT NULL AND p_expires_at <= now() THEN
+    RAISE EXCEPTION 'invalid_expiry';
+  END IF;
+  v_expires := COALESCE(
+    p_expires_at,
+    LEAST(now() + interval '72 hours', COALESCE(v_load.expires_at, now() + interval '72 hours'))
+  );
+
+  SELECT * INTO v_bid FROM public.freight_bids
+  WHERE load_id = v_load.id AND carrier_account_id = v_uid AND status = 'PENDING';
+  IF FOUND THEN
+    IF v_bid.bid_price <> p_bid_price OR v_bid.eta_pickup_at IS DISTINCT FROM p_eta_pickup_at THEN
+      INSERT INTO public.freight_bid_history
+        (bid_id, old_price, new_price, old_eta_pickup_at, new_eta_pickup_at, changed_by)
+      VALUES
+        (v_bid.id, v_bid.bid_price, p_bid_price, v_bid.eta_pickup_at, p_eta_pickup_at, v_uid);
+    END IF;
+    UPDATE public.freight_bids
+    SET bid_price = p_bid_price,
+        proposed_vehicle_id = p_proposed_vehicle_id,
+        proposed_driver_id = p_proposed_driver_id,
+        eta_pickup_at = p_eta_pickup_at,
+        note = p_note,
+        expires_at = v_expires
+    WHERE id = v_bid.id
+    RETURNING * INTO v_bid;
+    RETURN v_bid;
+  END IF;
+
+  INSERT INTO public.freight_bids
+    (load_id, carrier_account_id, bid_price, proposed_vehicle_id, proposed_driver_id,
+     eta_pickup_at, note, expires_at)
+  VALUES
+    (v_load.id, v_uid, p_bid_price, p_proposed_vehicle_id, p_proposed_driver_id,
+     p_eta_pickup_at, p_note, v_expires)
+  RETURNING * INTO v_bid;
+  RETURN v_bid;
+END;
+$$;
+
+/**
+ * Sửa bid của chính mình (chỉ khi PENDING và chưa hết hạn). Ghi
+ * freight_bid_history nếu giá hoặc ETA thay đổi rồi mới cập nhật.
+ */
+CREATE OR REPLACE FUNCTION public.freight_acct_update_bid(
+  p_bid_id uuid, p_bid_price numeric, p_proposed_vehicle_id uuid, p_proposed_driver_id uuid,
+  p_eta_pickup_at timestamptz, p_note text, p_expires_at timestamptz
+)
+RETURNS public.freight_bids
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid uuid := public.freight_require_uid();
+  v_bid public.freight_bids;
+  v_load public.freight_loads;
+BEGIN
+  SELECT * INTO v_bid FROM public.freight_bids WHERE id = p_bid_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'bid_not_found';
+  END IF;
+  IF v_bid.carrier_account_id <> v_uid THEN
+    RAISE EXCEPTION 'not_bid_owner';
+  END IF;
+  IF v_bid.status <> 'PENDING' THEN
+    RAISE EXCEPTION 'invalid_transition';
+  END IF;
+  IF v_bid.expires_at <= now() THEN
+    UPDATE public.freight_bids SET status = 'EXPIRED', closed_reason = 'expired' WHERE id = v_bid.id;
+    RAISE EXCEPTION 'bid_expired';
+  END IF;
+  SELECT * INTO v_load FROM public.freight_loads WHERE id = v_bid.load_id;
+  IF v_load.status <> 'POSTED' THEN
+    RAISE EXCEPTION 'load_not_open';
+  END IF;
+  IF p_bid_price IS NULL OR p_bid_price <= 0 THEN
+    RAISE EXCEPTION 'invalid_price';
+  END IF;
+  IF p_proposed_vehicle_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM public.freight_my_vehicles v
+    WHERE v.id = p_proposed_vehicle_id AND v.account_id = v_uid
+  ) THEN
+    RAISE EXCEPTION 'vehicle_not_found';
+  END IF;
+  IF p_proposed_driver_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM public.freight_my_drivers d
+    WHERE d.id = p_proposed_driver_id AND d.account_id = v_uid
+  ) THEN
+    RAISE EXCEPTION 'driver_not_found';
+  END IF;
+  IF p_expires_at IS NOT NULL AND p_expires_at <= now() THEN
+    RAISE EXCEPTION 'invalid_expiry';
+  END IF;
+  IF v_bid.bid_price <> p_bid_price OR v_bid.eta_pickup_at IS DISTINCT FROM p_eta_pickup_at THEN
+    INSERT INTO public.freight_bid_history
+      (bid_id, old_price, new_price, old_eta_pickup_at, new_eta_pickup_at, changed_by)
+    VALUES
+      (v_bid.id, v_bid.bid_price, p_bid_price, v_bid.eta_pickup_at, p_eta_pickup_at, v_uid);
+  END IF;
+  UPDATE public.freight_bids
+  SET bid_price = p_bid_price,
+      proposed_vehicle_id = p_proposed_vehicle_id,
+      proposed_driver_id = p_proposed_driver_id,
+      eta_pickup_at = p_eta_pickup_at,
+      note = p_note,
+      expires_at = COALESCE(p_expires_at, v_bid.expires_at)
+  WHERE id = v_bid.id
+  RETURNING * INTO v_bid;
+  RETURN v_bid;
+END;
+$$;
+
+/** Rút chào giá của chính mình (PENDING -> WITHDRAWN, không cần lý do). */
+CREATE OR REPLACE FUNCTION public.freight_acct_withdraw_bid(p_bid_id uuid)
+RETURNS public.freight_bids
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid uuid := public.freight_require_uid();
+  v_bid public.freight_bids;
+BEGIN
+  SELECT * INTO v_bid FROM public.freight_bids WHERE id = p_bid_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'bid_not_found';
+  END IF;
+  IF v_bid.carrier_account_id <> v_uid THEN
+    RAISE EXCEPTION 'not_bid_owner';
+  END IF;
+  IF v_bid.status <> 'PENDING' THEN
+    RAISE EXCEPTION 'invalid_transition';
+  END IF;
+  IF v_bid.expires_at <= now() THEN
+    UPDATE public.freight_bids SET status = 'EXPIRED', closed_reason = 'expired' WHERE id = v_bid.id;
+    RAISE EXCEPTION 'bid_expired';
+  END IF;
+  UPDATE public.freight_bids SET status = 'WITHDRAWN' WHERE id = v_bid.id
+  RETURNING * INTO v_bid;
+  RETURN v_bid;
+END;
+$$;
+
+/** Chủ tải từ chối MỘT bid (PENDING -> REJECTED, lý do tuỳ chọn). */
+CREATE OR REPLACE FUNCTION public.freight_acct_reject_bid(p_bid_id uuid, p_reason text)
+RETURNS public.freight_bids
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid uuid := public.freight_require_uid();
+  v_bid public.freight_bids;
+  v_load public.freight_loads;
+BEGIN
+  SELECT * INTO v_bid FROM public.freight_bids WHERE id = p_bid_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'bid_not_found';
+  END IF;
+  SELECT * INTO v_load FROM public.freight_loads WHERE id = v_bid.load_id;
+  IF v_load.poster_account_id IS DISTINCT FROM v_uid THEN
+    RAISE EXCEPTION 'not_poster';
+  END IF;
+  IF v_bid.status <> 'PENDING' THEN
+    RAISE EXCEPTION 'invalid_transition';
+  END IF;
+  IF v_bid.expires_at <= now() THEN
+    UPDATE public.freight_bids SET status = 'EXPIRED', closed_reason = 'expired' WHERE id = v_bid.id;
+    RAISE EXCEPTION 'bid_expired';
+  END IF;
+  UPDATE public.freight_bids
+  SET status = 'REJECTED',
+      closed_reason = COALESCE(NULLIF(btrim(p_reason), ''), 'rejected_by_shipper')
+  WHERE id = v_bid.id
+  RETURNING * INTO v_bid;
+  RETURN v_bid;
+END;
+$$;
+
+/**
+ * Chấp nhận MỘT bid — NGUYÊN TỬ trong một transaction (thiết kế 3.3.1):
+ * khoá bid + khoá tải, kiểm tra còn chốt được, tạo booking BOOKED với
+ * giá đóng băng = giá bid và xe/tài xế dự kiến đã gán sẵn, bid thắng ->
+ * ACCEPTED, các bid PENDING còn lại -> REJECTED (closed_reason='lost'),
+ * tải -> BOOKED, ghi sự kiện, đồng bộ đơn cũ (lỗi đồng bộ không chặn).
+ * accept_bid KHÔNG tạo liên kết PAST_DEAL — việc đó chỉ ở một chỗ duy
+ * nhất: khi chuyến sang COMPLETED trong freight_acct_advance_booking.
+ */
+CREATE OR REPLACE FUNCTION public.freight_acct_accept_bid(p_bid_id uuid)
+RETURNS public.freight_bookings
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid uuid := public.freight_require_uid();
+  v_bid public.freight_bids;
+  v_load public.freight_loads;
+  v_booking public.freight_bookings;
+BEGIN
+  -- 1. Khoá dòng bid.
+  SELECT * INTO v_bid FROM public.freight_bids WHERE id = p_bid_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'bid_not_found';
+  END IF;
+  -- 2. Khoá dòng tải; chỉ chủ tải mới chốt được bid cho tải của mình.
+  SELECT * INTO v_load FROM public.freight_loads WHERE id = v_bid.load_id FOR UPDATE;
+  IF v_load.poster_account_id IS DISTINCT FROM v_uid THEN
+    RAISE EXCEPTION 'not_party';
+  END IF;
+  -- Hết hạn lười: đóng các bid quá hạn của tải (kể cả bid đang xét) rồi
+  -- đọc lại trạng thái bid trước khi kiểm tra.
+  PERFORM public.freight_acct_expire_bids(v_load.id);
+  SELECT * INTO v_bid FROM public.freight_bids WHERE id = p_bid_id;
+  -- 3. Kiểm tra còn chốt được không.
+  IF v_bid.status = 'EXPIRED' THEN
+    RAISE EXCEPTION 'bid_expired';
+  END IF;
+  IF v_bid.status <> 'PENDING' THEN
+    RAISE EXCEPTION 'invalid_transition';
+  END IF;
+  IF v_load.status <> 'POSTED' THEN
+    RAISE EXCEPTION 'load_not_open';
+  END IF;
+  -- 4. Tạo booking ở trạng thái BOOKED ngay, giá đóng băng theo bid.
+  BEGIN
+    INSERT INTO public.freight_bookings
+      (code, load_id, order_id, shipper_group_id, carrier_group_id,
+       shipper_account_id, carrier_account_id, bid_id, price_agreed,
+       my_vehicle_id, my_driver_id, status)
+    VALUES
+      ('CH-' || lpad(nextval('public.freight_booking_code_seq')::text, 6, '0'),
+       v_load.id, v_load.order_id, v_load.group_id, NULL,
+       v_load.poster_account_id, v_bid.carrier_account_id, v_bid.id, v_bid.bid_price,
+       v_bid.proposed_vehicle_id, v_bid.proposed_driver_id, 'BOOKED')
+    RETURNING * INTO v_booking;
+  EXCEPTION WHEN unique_violation THEN
+    RAISE EXCEPTION 'already_booked';
+  END;
+  -- 5-7. Đóng bid thắng / bid thua / tải.
+  UPDATE public.freight_bids SET status = 'ACCEPTED' WHERE id = v_bid.id;
+  UPDATE public.freight_bids
+  SET status = 'REJECTED', closed_reason = 'lost'
+  WHERE load_id = v_load.id AND status = 'PENDING' AND id <> v_bid.id;
+  UPDATE public.freight_loads SET status = 'BOOKED' WHERE id = v_load.id;
+  -- 8-9. Sự kiện chuyến + đồng bộ ánh xạ sang đơn cũ (phụ trợ).
+  PERFORM public.freight_add_event(
+    v_booking.id, 'BOOKED', 'SHIPPER', NULL, 'BOOKED',
+    'Chốt qua chào giá ' || v_bid.bid_price::text || ' ' || v_bid.currency, NULL, NULL
+  );
+  PERFORM public.freight_sync_order(v_load.order_id, v_booking.code, 'BOOKED');
+  RETURN v_booking;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.freight_acct_place_bid(uuid, numeric, uuid, uuid, timestamptz, text, timestamptz) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_update_bid(uuid, numeric, uuid, uuid, timestamptz, text, timestamptz) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_withdraw_bid(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_reject_bid(uuid, text) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_accept_bid(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_expire_stale() TO authenticated;
+
 -- Realtime cho các bảng giao dịch (guarded: đã có trong publication thì bỏ qua).
 DO $$
 BEGIN
   ALTER PUBLICATION supabase_realtime ADD TABLE
-    public.freight_loads, public.freight_bookings, public.freight_booking_events;
+    public.freight_loads, public.freight_bookings, public.freight_booking_events, public.freight_bids;
 EXCEPTION WHEN OTHERS THEN
   RAISE NOTICE 'Khong them duoc bang freight vao publication supabase_realtime (%). Kiem tra thu cong neu can Realtime.', SQLERRM;
 END;
@@ -1434,7 +2015,8 @@ $$;
 -- =====================================================================
 -- KIỂM CHỨNG SAU KHI ÁP (chạy tay trong SQL Editor):
 --
--- 1) Các bảng/view freight_* đã tồn tại (kỳ vọng 10 bảng + 1 view):
+-- 1) Các bảng/view freight_* đã tồn tại (kỳ vọng 12 bảng + 1 view,
+--    gồm freight_bids + freight_bid_history của T2):
 --    SELECT table_name, table_type FROM information_schema.tables
 --    WHERE table_schema = 'public' AND table_name LIKE 'freight%'
 --    ORDER BY table_name;
@@ -1443,9 +2025,20 @@ $$;
 --    SELECT relname, relrowsecurity FROM pg_class
 --    WHERE relname LIKE 'freight%' AND relkind = 'r' ORDER BY relname;
 --
--- 3) RPC freight_acct_* đã có (kỳ vọng 12):
+-- 3) RPC freight_acct_* đã có (12 RPC nghiệp vụ R1 + 6 RPC/helper T2:
+--    place_bid, update_bid, withdraw_bid, reject_bid, accept_bid,
+--    expire_stale — chưa kể các helper freight_acct_is_linked,
+--    freight_acct_my_linked_ids, freight_acct_shares_group,
+--    freight_acct_actor_side, freight_acct_load_visible_to,
+--    freight_acct_can_see_bid, freight_acct_expire_bids):
 --    SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
 --    WHERE n.nspname = 'public' AND proname LIKE 'freight_acct%' ORDER BY proname;
+--
+-- 3b) Cột T2 đã có: freight_loads.open_for_bids + freight_bookings.bid_id:
+--    SELECT table_name, column_name FROM information_schema.columns
+--    WHERE table_schema = 'public'
+--      AND (table_name, column_name) IN (('freight_loads','open_for_bids'),
+--                                        ('freight_bookings','bid_id'));
 --
 -- 4) Thử luồng bằng 2 tài khoản test thật (khớp kịch bản nghiệm thu
 --    trong huong-dan-reset-va-cai-lai-freight.md):
@@ -1473,7 +2066,9 @@ $$;
 --     freight_bookings          -> mục 3 + RLS mục 5          [CO]
 --     freight_booking_events    -> mục 3 + RLS mục 5          [CO]
 --     freight_load_groups       -> mục 3 + RLS mục 5          [CO]
---     freight_loads_discover    -> view mục 6                 [CO]
+--     freight_loads_discover    -> view mục 6 (có open_for_bids) [CO]
+--     freight_bids              -> mục 8 + RLS mục 8 (T2)     [CO]
+--     freight_bid_history       -> mục 8 + RLS mục 8 (T2)     [CO]
 --   RPC client gọi (freightAccount.ts):
 --     freight_acct_upsert_profile, freight_acct_invite_link,
 --     freight_acct_respond_link, freight_acct_create_load,
@@ -1482,6 +2077,10 @@ $$;
 --     freight_acct_respond_booking, freight_acct_assign_vehicle_driver,
 --     freight_acct_advance_booking, freight_acct_cancel_booking
 --       -> tất cả có ở mục 7 kèm GRANT EXECUTE.            [DU 12/12]
+--     freight_acct_place_bid, freight_acct_update_bid,
+--     freight_acct_withdraw_bid, freight_acct_reject_bid,
+--     freight_acct_accept_bid, freight_acct_expire_stale
+--       -> tất cả có ở mục 8 kèm GRANT EXECUTE.             [DU 6/6]
 --   Client KHÔNG còn tham chiếu: freight_org_profiles,
 --   freight_carrier_profiles, freight_warehouse_profiles,
 --   freight_vehicles, freight_drivers, freight_service_routes,
