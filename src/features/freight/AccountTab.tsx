@@ -27,13 +27,6 @@ import {
   type MyVehicle,
   type MyWarehouse,
 } from '../../shared/supabase/freightAccount'
-import {
-  listDrivers,
-  listMyGroups,
-  listRoutes,
-  listVehicles,
-  listWarehouses,
-} from '../../shared/supabase/freight'
 import { validateDriver, validateServiceRoute, validateVehicle } from '../../domain/freight/profile'
 import { validateWarehouse } from '../../domain/freight/account'
 import { ProfileDialog } from './ProfileDialog'
@@ -62,11 +55,6 @@ export default function AccountTab({ ctx, onAccountChanged }: { ctx: FreightCtx;
   if (data.error) return <Notice kind="error">{data.error}</Notice>
   if (!data.data) return <p className="text-slate-600">Đang tải đăng ký của tôi…</p>
   const [warehouses, vehicles, drivers, routes] = data.data
-  const migrated =
-    warehouses.some((w) => w.legacy_source_id) ||
-    vehicles.some((v) => v.legacy_source_id) ||
-    drivers.some((d) => d.legacy_source_id) ||
-    routes.some((r) => r.legacy_source_id)
 
   async function dropRole(role: 'shipper' | 'carrier') {
     const other = role === 'shipper' ? a.is_carrier : a.is_shipper
@@ -104,12 +92,6 @@ export default function AccountTab({ ctx, onAccountChanged }: { ctx: FreightCtx;
   return (
     <div className="space-y-4">
       <SelfDeclaredNote />
-      {migrated && (
-        <Notice>
-          Một số kho/xe/tài xế/tuyến dưới đây được chuyển từ group của bạn (mô hình cũ) sang tài khoản của bạn — dữ
-          liệu cũ trong group vẫn còn nguyên để đối chiếu.
-        </Notice>
-      )}
       <div className="grid gap-4 md:grid-cols-2">
         <RoleCard
           title="Chủ kho / chủ hàng"
@@ -260,92 +242,6 @@ function RowActions({
   )
 }
 
-// ----- Sao chép từ group của tôi (prefill — thiết kế 1.8.3) -----
-
-type CopyKind = 'warehouse' | 'vehicle' | 'driver' | 'route'
-
-function CopyFromGroup({ kind, onPick }: { kind: CopyKind; onPick: (values: Record<string, string>) => void }) {
-  const [groupId, setGroupId] = useState('')
-  const [itemId, setItemId] = useState('')
-  const groups = useLoad(() => wrap(listMyGroups()), [])
-  const items = useLoad(
-    async () => {
-      if (!groupId) return [] as { id: string; label: string; values: Record<string, string> }[]
-      if (kind === 'warehouse') {
-        const rows = await listWarehouses(groupId)
-        return rows.map((w) => ({
-          id: w.id,
-          label: `${w.name} — ${w.address}`,
-          values: {
-            name: w.name, address: w.address, province: w.province ?? '',
-            dock_count: w.dock_count?.toString() ?? '', arrival_requirements: w.arrival_requirements ?? '',
-            contact_name: w.contact_name ?? '', contact_phone: w.contact_phone ?? '',
-            lat: w.lat?.toString() ?? '', lng: w.lng?.toString() ?? '',
-          },
-        }))
-      }
-      if (kind === 'vehicle') {
-        const rows = await listVehicles(groupId)
-        return rows.map((v) => ({
-          id: v.id,
-          label: `${v.plate} · ${v.vehicle_type}`,
-          values: {
-            plate: v.plate, vehicle_type: v.vehicle_type, payload_kg: v.payload_kg?.toString() ?? '',
-            box_length_m: v.box_length_m?.toString() ?? '', box_width_m: v.box_width_m?.toString() ?? '',
-            box_height_m: v.box_height_m?.toString() ?? '',
-            inspection_expires_at: v.inspection_expires_at ?? '', insurance_expires_at: v.insurance_expires_at ?? '',
-          },
-        }))
-      }
-      if (kind === 'driver') {
-        const rows = await listDrivers(groupId)
-        return rows.map((d) => ({
-          id: d.id,
-          label: d.full_name,
-          values: { full_name: d.full_name, phone: d.phone ?? '', license_class: d.license_class ?? '', license_expires_at: d.license_expires_at ?? '' },
-        }))
-      }
-      const rows = await listRoutes(groupId)
-      return rows.map((r) => ({
-        id: r.id,
-        label: `${r.from_province} → ${r.to_province}`,
-        values: { from_province: r.from_province, to_province: r.to_province, vehicle_type: r.vehicle_type ?? '', ref_price: r.ref_price?.toString() ?? '', note: r.note ?? '' },
-      }))
-    },
-    [groupId, kind],
-  )
-
-  return (
-    <div className="grid gap-3 rounded-lg bg-slate-50 p-3 sm:grid-cols-2">
-      <Field label="Sao chép từ group của tôi (không bắt buộc)">
-        <select className={inputClass} value={groupId} onChange={(e) => { setGroupId(e.target.value); setItemId('') }}>
-          <option value="">— Chọn group —</option>
-          {(groups.data ?? []).map((g) => (
-            <option key={g.id} value={g.id}>{g.name}</option>
-          ))}
-        </select>
-      </Field>
-      <Field label="Chọn mục để điền sẵn">
-        <select
-          className={inputClass}
-          value={itemId}
-          disabled={!groupId}
-          onChange={(e) => {
-            setItemId(e.target.value)
-            const it = (items.data ?? []).find((x) => x.id === e.target.value)
-            if (it) onPick(it.values)
-          }}
-        >
-          <option value="">— Chọn mục —</option>
-          {(items.data ?? []).map((it) => (
-            <option key={it.id} value={it.id}>{it.label}</option>
-          ))}
-        </select>
-      </Field>
-    </div>
-  )
-}
-
 // ----- Kho của tôi -----
 
 const WH_EMPTY = { name: '', address: '', province: '', dock_count: '', arrival_requirements: '', contact_name: '', contact_phone: '', open_from: '', open_to: '', lat: '', lng: '' }
@@ -369,7 +265,6 @@ function WarehousesSection({ ctx, items, onChanged }: { ctx: FreightCtx; items: 
         <div key={w.id} className="flex flex-wrap items-center gap-2 border-b border-slate-100 pb-2">
           <span className="font-medium">{w.name}</span>
           <span className="text-slate-600">{w.address}{w.province ? ` · ${w.province}` : ''}</span>
-          {w.legacy_source_id && <span className="text-slate-400">(chuyển từ mô hình cũ)</span>}
           {!w.active && <span className="text-slate-500">(đã ngừng dùng)</span>}
           <RowActions
             active={w.active}
@@ -447,7 +342,6 @@ function WarehouseDialog({ ctx, initial, onClose, onSaved }: { ctx: FreightCtx; 
 
   return (
     <FormDialog title={initial ? 'Sửa kho' : 'Thêm kho'} onClose={onClose} onSubmit={submit} busy={busy} error={err}>
-      {!initial && <CopyFromGroup kind="warehouse" onPick={(vals) => setForm((f) => ({ ...f, ...vals }))} />}
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label="Tên kho *"><input className={inputClass} value={form.name} onChange={(e) => set('name', e.target.value)} /></Field>
         <Field label="Địa chỉ *"><input className={inputClass} value={form.address} onChange={(e) => set('address', e.target.value)} /></Field>
@@ -492,7 +386,6 @@ function VehiclesSection({ ctx, items, onChanged }: { ctx: FreightCtx; items: My
           <span className="text-slate-600">
             {v.vehicle_type}{v.payload_kg ? ` · ${v.payload_kg} kg` : ''} · Đăng kiểm đến {fmtDate(v.inspection_expires_at)} · Bảo hiểm đến {fmtDate(v.insurance_expires_at)}
           </span>
-          {v.legacy_source_id && <span className="text-slate-400">(chuyển từ mô hình cũ)</span>}
           {!v.active && <span className="text-slate-500">(đã ngừng dùng)</span>}
           <RowActions
             active={v.active}
@@ -567,7 +460,6 @@ function VehicleDialog({ ctx, initial, onClose, onSaved }: { ctx: FreightCtx; in
 
   return (
     <FormDialog title={initial ? 'Sửa xe' : 'Thêm xe'} onClose={onClose} onSubmit={submit} busy={busy} error={err}>
-      {!initial && <CopyFromGroup kind="vehicle" onPick={(vals) => setForm((f) => ({ ...f, ...vals }))} />}
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label="Biển số *"><input className={inputClass} value={form.plate} onChange={(e) => set('plate', e.target.value)} /></Field>
         <Field label="Loại xe *">
@@ -618,7 +510,6 @@ function DriversSection({ ctx, items, onChanged }: { ctx: FreightCtx; items: MyD
             {d.license_class ? ` · Bằng ${d.license_class}` : ''} · Hạn bằng đến {fmtDate(d.license_expires_at)}
             {d.user_id ? ' · Đã liên kết tài khoản' : ''}
           </span>
-          {d.legacy_source_id && <span className="text-slate-400">(chuyển từ mô hình cũ)</span>}
           {!d.active && <span className="text-slate-500">(đã ngừng dùng)</span>}
           <RowActions
             active={d.active}
@@ -688,7 +579,6 @@ function DriverDialog({ ctx, initial, onClose, onSaved }: { ctx: FreightCtx; ini
 
   return (
     <FormDialog title={initial ? 'Sửa tài xế' : 'Thêm tài xế'} onClose={onClose} onSubmit={submit} busy={busy} error={err}>
-      {!initial && <CopyFromGroup kind="driver" onPick={(vals) => setForm((f) => ({ ...f, ...vals }))} />}
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label="Họ tên *"><input className={inputClass} value={form.full_name} onChange={(e) => set('full_name', e.target.value)} /></Field>
         <Field label="Điện thoại"><input className={inputClass} value={form.phone} onChange={(e) => set('phone', e.target.value)} inputMode="tel" /></Field>
@@ -756,7 +646,6 @@ function RoutesSection({ ctx, items, onChanged }: { ctx: FreightCtx; items: MyRo
             {r.ref_price ? ` · tham khảo ${r.ref_price.toLocaleString('vi-VN')} đ` : ''}
             {r.note ? ` · ${r.note}` : ''}
           </span>
-          {r.legacy_source_id && <span className="text-slate-400">(chuyển từ mô hình cũ)</span>}
           {!r.active && <span className="text-slate-500">(đã ngừng dùng)</span>}
           <RowActions
             active={r.active}
@@ -815,7 +704,6 @@ function RouteDialog({ ctx, initial, onClose, onSaved }: { ctx: FreightCtx; init
 
   return (
     <FormDialog title={initial ? 'Sửa tuyến' : 'Thêm tuyến'} onClose={onClose} onSubmit={submit} busy={busy} error={err}>
-      {!initial && <CopyFromGroup kind="route" onPick={(vals) => setForm((f) => ({ ...f, ...vals }))} />}
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label="Tỉnh đi *"><input className={inputClass} value={form.from_province} onChange={(e) => set('from_province', e.target.value)} /></Field>
         <Field label="Tỉnh đến *"><input className={inputClass} value={form.to_province} onChange={(e) => set('to_province', e.target.value)} /></Field>

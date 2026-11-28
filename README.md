@@ -198,7 +198,7 @@ sổ cái kèm người thực hiện + lý do bắt buộc cho điều chỉnh/
    phía server), POS tại quầy và đơn vị chứa pallet (chỉ làm khi vận hành
    thật cần).
 
-## Lớp trung gian giao tiếp (Bản A — T0/T1)
+## Lớp trung gian giao tiếp (Bản A) — mô hình theo TÀI KHOẢN
 
 Lớp chia sẻ mới trên Supabase (tách hẳn khỏi tồn kho localhost): kho/chủ hàng và nhà xe
 tự tìm thấy nhau, chốt chuyến và ghi lại quá trình giao nhận. Triết lý Bản A: hệ thống
@@ -206,60 +206,48 @@ chỉ là công cụ giao tiếp và ghi nhận — **không duyệt/xác thực
 hạn giấy tờ** (hạn giấy tờ chỉ hiển thị), hồ sơ là **thông tin do đơn vị tự khai — các
 bên tự xác minh khi giao dịch**, không phân xử tranh chấp, không xử lý thanh toán.
 
-Đã có trong code (T0+T1):
+Mô hình hiện tại (chốt 2026-11-28, thay mô hình theo group của T1): hồ sơ đăng ký
+thuộc về **tài khoản**, không thuộc group — xoá group không làm mất hồ sơ/tải/chuyến;
+group chỉ còn là không gian trao đổi giữa chủ hàng và vận tải. Một tài khoản có thể có
+nhiều kho và bật cả hai vai (chủ kho + vận tải) trên cùng một hồ sơ. Công cụ hiển thị
+tên **Tìm xe & chuyến** (Kho → Hệ thống), kèm trang **Điều khoản sử dụng** tối thiểu.
 
-- Migration `supabase/migrations/20261127000000_freight_t1_foundation.sql`: 10 bảng
-  `freight_*` (hồ sơ tổ chức/kho/xe/tài xế/tuyến, kết nối mạng lưới, tải đăng, chuyến,
-  sự kiện chuyến), RLS theo group/vai trò, view rút gọn `freight_loads_public`, và các
-  RPC `freight_create_load`, `freight_assign_booking` (chỉ định nhà xe), 
-  `freight_respond_booking`, `freight_advance_booking`, `freight_cancel_*`,
-  `freight_assign_vehicle_driver`. Chỉ tạo mới đối tượng `freight_*`, không sửa bảng cũ;
-  trạng thái chuyến ánh xạ một chiều sang 6 trạng thái đơn cũ qua lớp đồng bộ bọc lỗi.
-- Domain thuần `src/domain/freight/` (máy trạng thái Load/Booking, ánh xạ sang đơn cũ,
-  validate mềm hồ sơ tự khai) + test `tests/freight.test.ts`.
-- Màn hình **Vận tải** (Kho → Hệ thống) bản T1: hồ sơ đơn vị tự khai + xe/tài xế/tuyến +
-  kết nối mạng lưới; đăng tải tìm xe (từ đơn có sẵn hoặc độc lập, 3 mức hiển thị
-  DIRECT/NETWORK/PUBLIC) và chỉ định nhà xe; quản lý chuyến theo phía kèm dòng sự kiện.
-  *(UI T1 đã được thay bằng UI theo tài khoản của R1 — xem mục R1 bên dưới; phần mô tả
-  này giữ lại làm hồ sơ của giai đoạn T1.)*
-  Trang **Điều khoản sử dụng** tối thiểu (Kho → Hệ thống), phiên bản v1.
+Đã có trong code:
 
-**Trạng thái T0/T1: migration ĐÃ áp lên Supabase thật và đã kiểm thử thành công
-với 2 tài khoản thật (2026-11-28).** Hướng dẫn áp + đối chiếu schema nằm ở tài liệu
-`wms-nang-cap/huong-dan-t0-t1-supabase.md`.
+- Migration gộp bản sạch `supabase/migrations/20261128020000_freight_account_model_fresh.sql`:
+  toàn bộ schema freight ở trạng thái cuối của mô hình tài khoản — 10 bảng `freight_*`
+  (`freight_account_profiles`, `freight_my_warehouses/vehicles/drivers/routes`,
+  `freight_account_links`, `freight_loads`, `freight_bookings`,
+  `freight_booking_events`, `freight_load_groups`), view `freight_loads_discover`,
+  RLS theo tài khoản và chỉ bộ RPC `freight_acct_*` (12 RPC). Chỉ tạo đối tượng
+  `freight_*`; trạng thái chuyến ánh xạ một chiều sang 6 trạng thái đơn cũ qua lớp
+  đồng bộ bọc lỗi (`freight_sync_order`).
+- Domain thuần `src/domain/freight/` (máy trạng thái Load/Booking giữ nguyên từ T1,
+  ánh xạ sang đơn cũ, validate mềm hồ sơ tự khai, logic tài khoản ở `account.ts`) +
+  test `tests/freight.test.ts`, `tests/freight-account.test.ts`.
+- API client `src/shared/supabase/freightAccount.ts` (file `freight.ts` chỉ còn phần
+  nền dùng chung + đọc groups/orders_view tối thiểu); UI bằng **dialog Thêm/Sửa**
+  (component `FormDialog` dùng chung): tab Đăng ký của tôi / Tìm xe & Tải / Chuyến
+  của tôi / Kết nối.
 
-### R1 — mô hình danh tính theo TÀI KHOẢN (thay mô hình theo group của T1)
+### Quy trình phát triển freight: RESET — CÀI MỚI (không di trú)
 
-Quyết định thiết kế lại (2026-11-28): hồ sơ đăng ký thuộc về **tài khoản**, không
-thuộc group nữa — xoá group không làm mất hồ sơ/tải/chuyến; group chỉ còn là không
-gian trao đổi giữa chủ hàng và vận tải. Một tài khoản có thể có nhiều kho và bật cả
-hai vai (chủ kho + vận tải) trên cùng một hồ sơ. Công cụ đổi tên hiển thị thành
-**Tìm xe & chuyến** (mục Hệ thống).
+Dự án đang phát triển, dữ liệu freight chỉ là dữ liệu test nên **không làm migration
+di trú nữa**. Mỗi đợt sửa freight, Muse cập nhật file migration gộp ở trên; người
+dùng cài lại trên Supabase Dashboard → SQL Editor theo 3 bước:
 
-Đã có trong code (R1):
+1. (Tuỳ chọn) Chạy `supabase/wipe_legacy_test_data.sql` — file RIÊNG, chỉ TRUNCATE
+   **dữ liệu** trong các bảng cũ (orders, groups, messages, carriers, profiles...)
+   để xoá dữ liệu test cũ; không DROP cấu trúc, không đụng tài khoản đăng nhập
+   (profiles bị xoá dữ liệu nên tên hiển thị phải đặt lại).
+2. Chạy `supabase/reset_freight.sql` — xoá sạch **chỉ** các đối tượng `freight_*`
+   (bảng/view/sequence/hàm), tuyệt đối không đụng dữ liệu app đang chạy.
+3. Chạy migration gộp bản sạch ở trên, rồi kiểm chứng theo khối cuối file đó.
 
-- Migration `supabase/migrations/20261128000000_freight_r1_account_model.sql`: 7 bảng
-  mới (`freight_account_profiles`, `freight_my_warehouses/vehicles/drivers/routes`,
-  `freight_account_links`, `freight_load_groups`), cột tài khoản mới trên
-  `freight_loads`/`freight_bookings` (cột group cũ giữ nguyên, chỉ nới lỏng NOT NULL),
-  RLS + view `freight_loads_discover`, bộ RPC `freight_acct_*` chạy song song RPC cũ,
-  khối **di trú dữ liệu** (chủ sở hữu mặc định = `groups.created_by`, hợp nhất hai
-  vai bằng OR, map qua `legacy_source_id`) kèm truy vấn kiểm chứng ở cuối file.
-  Bảng/view T1 chỉ đánh dấu DEPRECATED bằng comment — không xoá, không phá.
-- Domain `src/domain/freight/account.ts` + test `tests/freight-account.test.ts`
-  (validate hai vai, phía diễn viên theo tài khoản, kết nối, quy tắc hiển thị gồm
-  "cùng group thấy tải NETWORK"). Máy trạng thái Load/Booking giữ nguyên.
-- API client `src/shared/supabase/freightAccount.ts`; UI viết lại toàn bộ bằng
-  **dialog Thêm/Sửa** (component `FormDialog` dùng chung): tab Đăng ký của tôi /
-  Tìm xe & Tải / Chuyến của tôi / Kết nối. Client cũ `freight.ts` giữ nguyên làm
-  đường rollback.
-
-**Trạng thái R1: code + migration đã sẵn sàng, CHƯA áp migration R1 lên Supabase
-thật.** Áp qua Dashboard SQL Editor theo tài liệu
-`wms-nang-cap/huong-dan-r1-di-tru-tai-khoan.md`, chạy các truy vấn kiểm chứng ở
-cuối file migration rồi nghiệm thu theo kịch bản trong hướng dẫn. Chưa làm:
-T2 chào giá (R2 — đã thiết kế, chưa triển khai), T3 POD + link theo dõi + ghi nhận
-cước, T4 đánh giá + GPS mức 2.
+Hướng dẫn chi tiết: `wms-nang-cap/huong-dan-reset-va-cai-lai-freight.md`.
+Hai migration freight cũ (T1 `20261127000000...` và R1 `20261128000000...`) đã bị
+xoá khỏi repo khi chuyển sang quy trình này. Chưa làm: T2 chào giá (đã thiết kế,
+chưa triển khai), T3 POD + link theo dõi + ghi nhận cước, T4 đánh giá + GPS mức 2.
 
 ## Triển khai lên GitHub Pages
 

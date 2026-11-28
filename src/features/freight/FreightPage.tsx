@@ -28,10 +28,10 @@ export default function FreightPage() {
           hoạt động. Phần kho vẫn chạy bình thường.
         </Notice>
         <Notice>
-          Để bật lớp trung gian giao tiếp: (1) cấu hình hai biến môi trường Supabase như tab Đơn &amp; chat; (2) áp
-          migration <code>supabase/migrations/20261127000000_freight_t1_foundation.sql</code> và{' '}
-          <code>supabase/migrations/20261128000000_freight_r1_account_model.sql</code> trong Supabase Dashboard → SQL
-          Editor (xem tài liệu hướng dẫn đi kèm dự án); (3) đăng nhập và đăng ký hồ sơ của tài khoản bạn tại đây.
+          Để bật lớp trung gian giao tiếp: (1) cấu hình hai biến môi trường Supabase như tab Đơn &amp; chat; (2) trong
+          Supabase Dashboard → SQL Editor, chạy <code>supabase/reset_freight.sql</code> rồi áp migration gộp bản sạch{' '}
+          <code>supabase/migrations/20261128020000_freight_account_model_fresh.sql</code> (xem tài liệu hướng dẫn reset
+          &amp; cài lại freight đi kèm dự án); (3) đăng nhập và đăng ký hồ sơ của tài khoản bạn tại đây.
         </Notice>
       </div>
     )
@@ -67,9 +67,10 @@ function AccountGate({ me, displayName }: { me: string; displayName: string }) {
       <div className="space-y-3">
         <Notice kind="error">Không tải được hồ sơ tài khoản: {profile.error}</Notice>
         <Notice>
-          Nếu lỗi nhắc tới bảng <code>freight_account_profiles</code> chưa tồn tại, migration R1 (
-          <code>20261128000000_freight_r1_account_model.sql</code>) chưa được áp trên Supabase — xem tài liệu hướng
-          dẫn R1 đi kèm dự án.
+          Nếu lỗi nhắc tới bảng <code>freight_account_profiles</code> chưa tồn tại, migration gộp bản sạch (
+          <code>20261128020000_freight_account_model_fresh.sql</code>) chưa được áp trên Supabase — chạy{' '}
+          <code>supabase/reset_freight.sql</code> rồi áp migration đó theo tài liệu hướng dẫn reset &amp; cài lại
+          freight đi kèm dự án.
         </Notice>
       </div>
     )

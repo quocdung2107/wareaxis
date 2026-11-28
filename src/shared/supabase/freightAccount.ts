@@ -1,8 +1,9 @@
-// Client cho mô hình danh tính THEO TÀI KHOẢN (R1) của lớp trung gian
-// giao tiếp. Bọc RPC freight_acct_* + CRUD qua RLS của migration
-// 20261128000000_freight_r1_account_model.sql.
-// File freight.ts (mô hình theo group của T1) GIỮ NGUYÊN làm đường
-// rollback — UI mới chỉ dùng file này.
+// Client cho mô hình danh tính THEO TÀI KHOẢN của lớp trung gian giao
+// tiếp. Bọc RPC freight_acct_* + CRUD qua RLS của migration gộp bản
+// sạch 20261128020000_freight_account_model_fresh.sql (quy trình phát
+// triển: reset_freight.sql -> chạy lại migration fresh, không di trú).
+// File freight.ts chỉ còn phần nền dùng chung (mã lỗi, kiểu tải/chuyến,
+// đọc groups/orders_view tối thiểu) — UI chỉ dùng file này cho nghiệp vụ.
 import { supabase } from './client'
 import { FreightError, freightErrText, type Booking, type BookingEvent, type FreightLoad } from './freight'
 import type { AccountLinkStatus } from '../../domain/freight/account'
@@ -24,7 +25,7 @@ const ACCT_ERRORS: Record<string, string> = {
   cannot_link_self: 'Không thể kết nối với chính tài khoản của mình.',
 }
 
-/** Map lỗi RPC sang tiếng Việt: mã mới của R1 trước, còn lại dùng map của T1. */
+/** Map lỗi RPC sang tiếng Việt: mã riêng của mô hình tài khoản trước, còn lại dùng map dùng chung. */
 export function freightAcctErrText(e: unknown): string {
   const m = String((e as { message?: string } | null)?.message ?? '')
   for (const [k, v] of Object.entries(ACCT_ERRORS)) if (m.includes(k)) return v
@@ -43,7 +44,7 @@ async function query<T>(fn: () => PromiseLike<{ data: unknown; error: { message:
   return data as T
 }
 
-// ----- Kiểu dữ liệu (khớp bảng mới của migration R1) -----
+// ----- Kiểu dữ liệu (khớp bảng của migration fresh) -----
 
 export interface AccountProfile {
   account_id: string
@@ -77,7 +78,6 @@ export interface MyWarehouse {
   contact_name: string | null
   contact_phone: string | null
   active: boolean
-  legacy_source_id: string | null
 }
 
 export interface MyVehicle {
@@ -92,7 +92,6 @@ export interface MyVehicle {
   inspection_expires_at: string | null
   insurance_expires_at: string | null
   active: boolean
-  legacy_source_id: string | null
 }
 
 export interface MyDriver {
@@ -104,7 +103,6 @@ export interface MyDriver {
   license_class: string | null
   license_expires_at: string | null
   active: boolean
-  legacy_source_id: string | null
 }
 
 export interface MyRoute {
@@ -116,7 +114,6 @@ export interface MyRoute {
   ref_price: number | null
   note: string | null
   active: boolean
-  legacy_source_id: string | null
 }
 
 export interface AccountLink {
@@ -129,7 +126,7 @@ export interface AccountLink {
   created_at: string
 }
 
-/** Tải theo mô hình tài khoản (bảng freight_loads + cột R1). */
+/** Tải theo mô hình tài khoản (bảng freight_loads, mô hình tài khoản). */
 export type AcctLoad = FreightLoad & {
   poster_account_id: string | null
   directed_account_id: string | null
@@ -159,7 +156,7 @@ export interface DiscoverLoad {
   created_at: string
 }
 
-/** Chuyến theo mô hình tài khoản (bảng freight_bookings + cột R1). */
+/** Chuyến theo mô hình tài khoản (bảng freight_bookings, mô hình tài khoản). */
 export type AcctBooking = Booking & {
   shipper_account_id: string | null
   carrier_account_id: string | null
@@ -236,7 +233,7 @@ export async function listMyWarehouses(me: string): Promise<MyWarehouse[]> {
   )
 }
 
-export type MyWarehouseInput = Omit<MyWarehouse, 'id' | 'account_id' | 'active' | 'legacy_source_id'> & { active?: boolean }
+export type MyWarehouseInput = Omit<MyWarehouse, 'id' | 'account_id' | 'active'> & { active?: boolean }
 
 export async function saveMyWarehouse(me: string, id: string | null, i: MyWarehouseInput): Promise<void> {
   const row = { account_id: me, ...i }
@@ -258,7 +255,7 @@ export async function listMyVehicles(me: string): Promise<MyVehicle[]> {
   return query<MyVehicle[]>(() => sb().from('freight_my_vehicles').select('*').eq('account_id', me).order('plate', { ascending: true }))
 }
 
-export type MyVehicleInput = Omit<MyVehicle, 'id' | 'account_id' | 'active' | 'legacy_source_id'> & { active?: boolean }
+export type MyVehicleInput = Omit<MyVehicle, 'id' | 'account_id' | 'active'> & { active?: boolean }
 
 export async function saveMyVehicle(me: string, id: string | null, i: MyVehicleInput): Promise<void> {
   const row = { account_id: me, ...i }
@@ -280,7 +277,7 @@ export async function listMyDrivers(me: string): Promise<MyDriver[]> {
   return query<MyDriver[]>(() => sb().from('freight_my_drivers').select('*').eq('account_id', me).order('full_name', { ascending: true }))
 }
 
-export type MyDriverInput = Omit<MyDriver, 'id' | 'account_id' | 'active' | 'legacy_source_id'> & { active?: boolean }
+export type MyDriverInput = Omit<MyDriver, 'id' | 'account_id' | 'active'> & { active?: boolean }
 
 export async function saveMyDriver(me: string, id: string | null, i: MyDriverInput): Promise<void> {
   const row = { account_id: me, ...i }
@@ -302,7 +299,7 @@ export async function listMyRoutes(me: string): Promise<MyRoute[]> {
   return query<MyRoute[]>(() => sb().from('freight_my_routes').select('*').eq('account_id', me).order('created_at', { ascending: true }))
 }
 
-export type MyRouteInput = Omit<MyRoute, 'id' | 'account_id' | 'active' | 'legacy_source_id'> & { active?: boolean }
+export type MyRouteInput = Omit<MyRoute, 'id' | 'account_id' | 'active'> & { active?: boolean }
 
 export async function saveMyRoute(me: string, id: string | null, i: MyRouteInput): Promise<void> {
   const row = { account_id: me, ...i }
