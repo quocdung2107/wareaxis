@@ -721,35 +721,10 @@ AS $$
   );
 $$;
 
-/** Xe này có được ĐỀ XUẤT trong bid cho một tải của auth.uid() không. */
-CREATE OR REPLACE FUNCTION public.freight_acct_vehicle_proposed_to_me(p_vehicle_id uuid)
-RETURNS boolean
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = public
-AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM public.freight_bids b
-    JOIN public.freight_loads l ON l.id = b.load_id
-    WHERE b.proposed_vehicle_id = p_vehicle_id AND l.poster_account_id = auth.uid()
-  );
-$$;
-
-/** Tài xế này có được ĐỀ XUẤT trong bid cho một tải của auth.uid() không. */
-CREATE OR REPLACE FUNCTION public.freight_acct_driver_proposed_to_me(p_driver_id uuid)
-RETURNS boolean
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = public
-AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM public.freight_bids b
-    JOIN public.freight_loads l ON l.id = b.load_id
-    WHERE b.proposed_driver_id = p_driver_id AND l.poster_account_id = auth.uid()
-  );
-$$;
+-- (Hai helper *_proposed_to_me tham chiếu freight_bids — bảng chỉ được
+-- tạo ở Phần T2 — nên chúng được định nghĩa ở Phần T2, ngay trước các
+-- policy dùng chúng. Hàm LANGUAGE sql kiểm tra bảng tham chiếu ngay
+-- khi CREATE nên không thể định nghĩa trước khi bảng tồn tại.)
 
 -- Hồ sơ tài khoản: mọi người đã đăng nhập đọc được (thư mục đối tác —
 -- thông tin tự khai để hai bên liên lạc, luôn hiển thị kèm nhãn tự khai
@@ -908,8 +883,6 @@ GRANT EXECUTE ON FUNCTION public.freight_acct_load_has_my_booking(uuid) TO authe
 GRANT EXECUTE ON FUNCTION public.freight_acct_vehicle_in_my_booking(uuid) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.freight_acct_driver_in_my_booking(uuid) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.freight_acct_warehouse_pickup_for_me(uuid) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.freight_acct_vehicle_proposed_to_me(uuid) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.freight_acct_driver_proposed_to_me(uuid) TO authenticated;
 
 -- ---------------------------------------------------------------------
 -- 6. VIEW TRA CỨU freight_loads_discover (bản rút gọn theo tài khoản)
@@ -1746,6 +1719,42 @@ CREATE POLICY freight_bid_history_select ON public.freight_bid_history
 
 -- Chủ tải đọc được xe/tài xế ĐƯỢC ĐỀ XUẤT trong bid cho tải của mình
 -- (hiển thị biển số/loại xe trong bảng chào giá trước khi chốt).
+-- Helper đặt TẠI ĐÂY (sau khi freight_bids đã tồn tại) vì hàm LANGUAGE
+-- sql kiểm tra bảng tham chiếu ngay khi CREATE — xem ghi chú Phần 5.
+
+/** Xe này có được ĐỀ XUẤT trong bid cho một tải của auth.uid() không. */
+CREATE OR REPLACE FUNCTION public.freight_acct_vehicle_proposed_to_me(p_vehicle_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_bids b
+    JOIN public.freight_loads l ON l.id = b.load_id
+    WHERE b.proposed_vehicle_id = p_vehicle_id AND l.poster_account_id = auth.uid()
+  );
+$$;
+
+/** Tài xế này có được ĐỀ XUẤT trong bid cho một tải của auth.uid() không. */
+CREATE OR REPLACE FUNCTION public.freight_acct_driver_proposed_to_me(p_driver_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.freight_bids b
+    JOIN public.freight_loads l ON l.id = b.load_id
+    WHERE b.proposed_driver_id = p_driver_id AND l.poster_account_id = auth.uid()
+  );
+$$;
+
+GRANT EXECUTE ON FUNCTION public.freight_acct_vehicle_proposed_to_me(uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.freight_acct_driver_proposed_to_me(uuid) TO authenticated;
+
 DROP POLICY IF EXISTS freight_my_vehicles_select_bid ON public.freight_my_vehicles;
 CREATE POLICY freight_my_vehicles_select_bid ON public.freight_my_vehicles
   FOR SELECT TO authenticated USING (
