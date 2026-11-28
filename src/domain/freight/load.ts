@@ -59,7 +59,10 @@ export interface LoadInput {
   pickup_window_from?: string | null
   pickup_window_to?: string | null
   visibility: LoadVisibility
+  /** T1 (theo group) — giữ để tương thích dữ liệu/RPC cũ. */
   directed_group_id?: string | null
+  /** R1 (theo tài khoản): tài khoản nhà xe được chỉ định ở mức DIRECT. */
+  directed_account_id?: string | null
   asking_price?: number | null
 }
 
@@ -80,6 +83,8 @@ export function validateLoadInput(i: LoadInput): string[] {
   if (i.pickup_window_from && i.pickup_window_to && i.pickup_window_from > i.pickup_window_to) {
     errs.push('Cửa sổ giờ lấy hàng không hợp lệ (từ > đến).')
   }
-  if (i.visibility === 'DIRECT' && !i.directed_group_id) errs.push('Mức "Chỉ định" cần chọn một nhà xe.')
+  if (i.visibility === 'DIRECT' && !i.directed_group_id && !i.directed_account_id) {
+    errs.push('Mức "Chỉ định" cần chọn một nhà xe.')
+  }
   return errs
 }

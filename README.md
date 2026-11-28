@@ -217,16 +217,49 @@ bên tự xác minh khi giao dịch**, không phân xử tranh chấp, không x�
   trạng thái chuyến ánh xạ một chiều sang 6 trạng thái đơn cũ qua lớp đồng bộ bọc lỗi.
 - Domain thuần `src/domain/freight/` (máy trạng thái Load/Booking, ánh xạ sang đơn cũ,
   validate mềm hồ sơ tự khai) + test `tests/freight.test.ts`.
-- Màn hình **Vận tải** (Kho → Hệ thống): hồ sơ đơn vị tự khai + xe/tài xế/tuyến + kết nối
-  mạng lưới; đăng tải tìm xe (từ đơn có sẵn hoặc độc lập, 3 mức hiển thị
+- Màn hình **Vận tải** (Kho → Hệ thống) bản T1: hồ sơ đơn vị tự khai + xe/tài xế/tuyến +
+  kết nối mạng lưới; đăng tải tìm xe (từ đơn có sẵn hoặc độc lập, 3 mức hiển thị
   DIRECT/NETWORK/PUBLIC) và chỉ định nhà xe; quản lý chuyến theo phía kèm dòng sự kiện.
+  *(UI T1 đã được thay bằng UI theo tài khoản của R1 — xem mục R1 bên dưới; phần mô tả
+  này giữ lại làm hồ sơ của giai đoạn T1.)*
   Trang **Điều khoản sử dụng** tối thiểu (Kho → Hệ thống), phiên bản v1.
 
-**Trạng thái: code + migration đã sẵn sàng, CHƯA áp lên Supabase thật.** Muốn bật tính
-năng: export schema thật để đối chiếu giả định rồi áp migration qua Dashboard SQL
-Editor theo tài liệu hướng dẫn T0/T1 đi kèm dự án (thư mục tài liệu
-`wms-nang-cap/huong-dan-t0-t1-supabase.md`). Chưa làm: T2 chào giá, T3 POD + link theo
-dõi + ghi nhận cước, T4 đánh giá + GPS mức 2.
+**Trạng thái T0/T1: migration ĐÃ áp lên Supabase thật và đã kiểm thử thành công
+với 2 tài khoản thật (2026-11-28).** Hướng dẫn áp + đối chiếu schema nằm ở tài liệu
+`wms-nang-cap/huong-dan-t0-t1-supabase.md`.
+
+### R1 — mô hình danh tính theo TÀI KHOẢN (thay mô hình theo group của T1)
+
+Quyết định thiết kế lại (2026-11-28): hồ sơ đăng ký thuộc về **tài khoản**, không
+thuộc group nữa — xoá group không làm mất hồ sơ/tải/chuyến; group chỉ còn là không
+gian trao đổi giữa chủ hàng và vận tải. Một tài khoản có thể có nhiều kho và bật cả
+hai vai (chủ kho + vận tải) trên cùng một hồ sơ. Công cụ đổi tên hiển thị thành
+**Tìm xe & chuyến** (mục Hệ thống).
+
+Đã có trong code (R1):
+
+- Migration `supabase/migrations/20261128000000_freight_r1_account_model.sql`: 7 bảng
+  mới (`freight_account_profiles`, `freight_my_warehouses/vehicles/drivers/routes`,
+  `freight_account_links`, `freight_load_groups`), cột tài khoản mới trên
+  `freight_loads`/`freight_bookings` (cột group cũ giữ nguyên, chỉ nới lỏng NOT NULL),
+  RLS + view `freight_loads_discover`, bộ RPC `freight_acct_*` chạy song song RPC cũ,
+  khối **di trú dữ liệu** (chủ sở hữu mặc định = `groups.created_by`, hợp nhất hai
+  vai bằng OR, map qua `legacy_source_id`) kèm truy vấn kiểm chứng ở cuối file.
+  Bảng/view T1 chỉ đánh dấu DEPRECATED bằng comment — không xoá, không phá.
+- Domain `src/domain/freight/account.ts` + test `tests/freight-account.test.ts`
+  (validate hai vai, phía diễn viên theo tài khoản, kết nối, quy tắc hiển thị gồm
+  "cùng group thấy tải NETWORK"). Máy trạng thái Load/Booking giữ nguyên.
+- API client `src/shared/supabase/freightAccount.ts`; UI viết lại toàn bộ bằng
+  **dialog Thêm/Sửa** (component `FormDialog` dùng chung): tab Đăng ký của tôi /
+  Tìm xe & Tải / Chuyến của tôi / Kết nối. Client cũ `freight.ts` giữ nguyên làm
+  đường rollback.
+
+**Trạng thái R1: code + migration đã sẵn sàng, CHƯA áp migration R1 lên Supabase
+thật.** Áp qua Dashboard SQL Editor theo tài liệu
+`wms-nang-cap/huong-dan-r1-di-tru-tai-khoan.md`, chạy các truy vấn kiểm chứng ở
+cuối file migration rồi nghiệm thu theo kịch bản trong hướng dẫn. Chưa làm:
+T2 chào giá (R2 — đã thiết kế, chưa triển khai), T3 POD + link theo dõi + ghi nhận
+cước, T4 đánh giá + GPS mức 2.
 
 ## Triển khai lên GitHub Pages
 

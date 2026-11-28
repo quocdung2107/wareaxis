@@ -96,3 +96,9 @@ export async function promptNumber(message: string, defaultValue: string): Promi
   const r = await open({ message, input: { defaultValue, inputMode: 'decimal' } })
   return typeof r === 'string' ? r : null
 }
+
+/** Ô nhập chữ (ví dụ lý do huỷ); trả chuỗi đã nhập, hoặc null nếu Huỷ/Esc. */
+export async function promptText(message: string, defaultValue = ''): Promise<string | null> {
+  const r = await open({ message, input: { defaultValue, inputMode: 'text' } })
+  return typeof r === 'string' ? r : null
+}

@@ -1,5 +1,10 @@
 // Hồ sơ tự khai (tổ chức / xe / tài xế / tuyến) — validate THUẦN HÌNH THỨC.
 // Nguồn thiết kế: Bản A mục 0.2 + 2.2 + 3.5. Triết lý bắt buộc:
+// LƯU Ý R1: ORG_TYPES / OrgProfileInput / validateOrgProfile là mô hình
+// THEO GROUP của T1 — DEPRECATED, giữ lại cho client/dữ liệu cũ. Hồ sơ
+// mới theo TÀI KHOẢN nằm ở account.ts (AccountProfileInput /
+// validateAccountProfile). Validate xe/tài xế/tuyến trong file này vẫn
+// dùng chung cho cả hai mô hình.
 //   * Hồ sơ do đơn vị TỰ KHAI, hệ thống không xác thực, không duyệt.
 //   * Ngày hết hạn giấy tờ (đăng kiểm / bảo hiểm / bằng lái) CHỈ để hiển thị
 //     cho đối tác tự đánh giá. Validate ở đây TUYỆT ĐỐI không lỗi vì ngày

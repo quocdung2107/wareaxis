@@ -1,27 +1,22 @@
 import { useState } from 'react'
-import { Button, Notice, useLoad } from '../../shared/ui/ui'
-import { freightErrText, freightStatus, listMyGroups, myRolesInGroup } from '../../shared/supabase/freight'
+import { Button, Card, Notice, useLoad } from '../../shared/ui/ui'
+import { freightStatus } from '../../shared/supabase/freight'
+import { freightAcctErrText, getMyAccountProfile } from '../../shared/supabase/freightAccount'
 import { LoginForm } from '../orders/LoginForm'
 import { useSession } from '../orders/useSession'
+import { ProfileDialog } from './ProfileDialog'
 import type { FreightCtx } from './shared'
-import ProfileTab from './ProfileTab'
+import AccountTab from './AccountTab'
 import LoadsTab from './LoadsTab'
 import BookingsTab from './BookingsTab'
+import LinksTab from './LinksTab'
 
-const KEY = 'wa.group'
-const saved = () => {
-  try {
-    return localStorage.getItem(KEY) ?? ''
-  } catch {
-    return ''
-  }
-}
-
-type Tab = 'profile' | 'loads' | 'bookings'
+type Tab = 'account' | 'loads' | 'bookings' | 'links'
 const TABS: { id: Tab; label: string }[] = [
-  { id: 'profile', label: 'Hồ sơ đơn vị' },
-  { id: 'loads', label: 'Tìm xe / Tải đang đăng' },
+  { id: 'account', label: 'Đăng ký của tôi' },
+  { id: 'loads', label: 'Tìm xe / Tải' },
   { id: 'bookings', label: 'Chuyến của tôi' },
+  { id: 'links', label: 'Kết nối' },
 ]
 
 export default function FreightPage() {
@@ -29,13 +24,14 @@ export default function FreightPage() {
     return (
       <div className="space-y-3">
         <Notice kind="warn">
-          Chưa cấu hình Supabase (thiếu VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY) nên phần Vận tải chưa hoạt động. Phần
-          kho vẫn chạy bình thường.
+          Chưa cấu hình Supabase (thiếu VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY) nên phần Tìm xe &amp; chuyến chưa
+          hoạt động. Phần kho vẫn chạy bình thường.
         </Notice>
         <Notice>
           Để bật lớp trung gian giao tiếp: (1) cấu hình hai biến môi trường Supabase như tab Đơn &amp; chat; (2) áp
-          migration <code>supabase/migrations/20261127000000_freight_t1_foundation.sql</code> trong Supabase Dashboard →
-          SQL Editor (xem tài liệu hướng dẫn T0/T1 đi kèm dự án); (3) đăng nhập và khai hồ sơ đơn vị tại đây.
+          migration <code>supabase/migrations/20261127000000_freight_t1_foundation.sql</code> và{' '}
+          <code>supabase/migrations/20261128000000_freight_r1_account_model.sql</code> trong Supabase Dashboard → SQL
+          Editor (xem tài liệu hướng dẫn đi kèm dự án); (3) đăng nhập và đăng ký hồ sơ của tài khoản bạn tại đây.
         </Notice>
       </div>
     )
@@ -47,71 +43,87 @@ function FreightInner() {
   const session = useSession()
   if (session === undefined) return <p className="text-slate-600">Đang kiểm tra đăng nhập…</p>
   if (!session) return <LoginForm />
-  return <Groups me={session.user.id} />
+  return <AccountGate me={session.user.id} displayName={session.user.email ?? ''} />
 }
 
-function Groups({ me }: { me: string }) {
-  const [sel, setSel] = useState(saved)
-  const [tab, setTab] = useState<Tab>('profile')
-  const groups = useLoad(
+/**
+ * Cổng vào theo TÀI KHOẢN (R1): không cần chọn group nữa. Chưa có hồ sơ
+ * đăng ký thì hiện màn hình chào + nút mở dialog đăng ký; đã có thì vào
+ * thẳng các tab. Hồ sơ nạp một lần ở đây và truyền xuống qua FreightCtx.
+ */
+function AccountGate({ me, displayName }: { me: string; displayName: string }) {
+  const [tab, setTab] = useState<Tab>('account')
+  const [registerOpen, setRegisterOpen] = useState(false)
+  const profile = useLoad(
     () =>
-      listMyGroups().catch((e) => {
-        throw new Error(freightErrText(e))
+      getMyAccountProfile(me).catch((e) => {
+        throw new Error(freightAcctErrText(e))
       }),
-    [],
-  )
-  const current = groups.data?.find((g) => g.id === sel) ?? groups.data?.[0]
-  const roles = useLoad(
-    async () => (current ? myRolesInGroup(current.id, me).catch(() => [] as string[]) : ([] as string[])),
-    [current?.id, me],
+    [me],
   )
 
-  function pick(id: string) {
-    setSel(id)
-    try {
-      localStorage.setItem(KEY, id)
-    } catch {
-      /* bỏ qua */
-    }
+  if (profile.error) {
+    return (
+      <div className="space-y-3">
+        <Notice kind="error">Không tải được hồ sơ tài khoản: {profile.error}</Notice>
+        <Notice>
+          Nếu lỗi nhắc tới bảng <code>freight_account_profiles</code> chưa tồn tại, migration R1 (
+          <code>20261128000000_freight_r1_account_model.sql</code>) chưa được áp trên Supabase — xem tài liệu hướng
+          dẫn R1 đi kèm dự án.
+        </Notice>
+      </div>
+    )
+  }
+  if (profile.loading && !profile.data) return <p className="text-slate-600">Đang tải hồ sơ của bạn…</p>
+
+  if (!profile.data) {
+    return (
+      <div className="space-y-4">
+        <Card className="space-y-3">
+          <h3 className="text-lg font-semibold">Đăng ký của tôi</h3>
+          <p className="text-slate-600">
+            Tài khoản của bạn chưa có thông tin đăng ký cho lớp trung gian giao tiếp. Mỗi tài khoản có một thông tin
+            đăng ký riêng của mình: xác định bạn là <strong>chủ kho</strong> (và tạo nội dung chủ kho: các kho của
+            bạn), đăng ký <strong>vận tải</strong> (đội xe của bạn), hoặc cả hai — không thông qua group. Group chỉ
+            là nơi trao đổi giữa chủ hàng và vận tải.
+          </p>
+          <p className="text-slate-600">
+            Thông tin đăng ký là thông tin do bạn tự khai — các bên tự xác minh khi giao dịch; hệ thống không duyệt
+            hồ sơ.
+          </p>
+          <Button onClick={() => setRegisterOpen(true)}>Đăng ký hồ sơ của tôi</Button>
+        </Card>
+        {registerOpen && (
+          <ProfileDialog
+            initial={null}
+            defaultDisplayName={displayName}
+            onClose={() => setRegisterOpen(false)}
+            onSaved={() => {
+              setRegisterOpen(false)
+              profile.reload()
+            }}
+          />
+        )}
+      </div>
+    )
   }
 
-  if (groups.error) return <Notice kind="error">Không tải được danh sách group: {groups.error}</Notice>
-  if (!groups.data) return <p className="text-slate-600">Đang tải…</p>
-  if (groups.data.length === 0) {
-    return <Notice>Bạn chưa thuộc group nào. Hãy tạo group hoặc nhờ admin thêm bạn ở tab Đơn &amp; chat trước.</Notice>
-  }
-
-  const ctx: FreightCtx = { groupId: current!.id, groupName: current!.name, me, roles: roles.data ?? [] }
-
+  const ctx: FreightCtx = { me, account: profile.data }
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap gap-2" role="tablist" aria-label="Group">
-        {groups.data.map((g) => (
-          <button
-            key={g.id}
-            role="tab"
-            aria-selected={current?.id === g.id}
-            onClick={() => pick(g.id)}
-            className={`min-h-11 max-w-full truncate rounded-lg border px-4 text-base ${
-              current?.id === g.id ? 'border-brand-600 bg-brand-600 font-semibold text-white' : 'border-slate-300 bg-white'
-            }`}
-          >
-            {g.name}
-          </button>
-        ))}
-      </div>
-
-      <div className="flex flex-wrap gap-2" role="tablist" aria-label="Mục vận tải">
+      <div className="flex flex-wrap gap-2" role="tablist" aria-label="Mục tìm xe và chuyến">
         {TABS.map((t) => (
           <Button key={t.id} kind={tab === t.id ? 'primary' : 'secondary'} onClick={() => setTab(t.id)} aria-pressed={tab === t.id}>
             {t.label}
           </Button>
         ))}
       </div>
-
-      {tab === 'profile' && <ProfileTab key={`p-${ctx.groupId}`} ctx={ctx} />}
-      {tab === 'loads' && <LoadsTab key={`l-${ctx.groupId}`} ctx={ctx} />}
-      {tab === 'bookings' && <BookingsTab key={`b-${ctx.groupId}`} ctx={ctx} />}
+      {tab === 'account' && (
+        <AccountTab key={`a-${profile.data.updated_at}`} ctx={ctx} onAccountChanged={profile.reload} />
+      )}
+      {tab === 'loads' && <LoadsTab key="l" ctx={ctx} />}
+      {tab === 'bookings' && <BookingsTab key="b" ctx={ctx} />}
+      {tab === 'links' && <LinksTab key="k" ctx={ctx} />}
     </div>
   )
 }
